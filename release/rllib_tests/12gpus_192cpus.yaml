@@ -13,6 +13,7 @@ worker_node_types:
       min_workers: 12
       max_workers: 12
       use_spot: false
+worker_node_types:
     - name: worker_node_cpu
       instance_type: m5.2xlarge
       min_workers: 2
