@@ -14,7 +14,7 @@ class RecommSys001(gym.Env):
                  slate_size: int,
                  num_docs_in_db: Optional[int] = None,
                  num_users_in_db: Optional[int] = None,
-                 user_time_budget: float = 60.0,
+                 user_time_budget: float = 1.0,
                  ):
         """Initializes a RecommSys001 instance.
 
@@ -43,17 +43,21 @@ class RecommSys001(gym.Env):
         self.docs_db = None
         self.num_users_in_db = num_users_in_db
         self.users_db = None
+        self.current_user = None
 
         self.user_time_budget = user_time_budget
+        self.current_user_budget = user_time_budget
 
         self.observation_space = gym.spaces.Dict({
             # The D docs our agent sees at each timestep. It has to select a k-slate
             # out of these.
             "doc": gym.spaces.Dict({
-                str(idx): gym.spaces.Box(0.0, 1.0, shape=(self.num_categories,), dtype=np.float32) for idx in range(self.num_docs_to_select_from)
+                str(idx):
+                    gym.spaces.Box(-1.0, 1.0, shape=(self.num_categories,), dtype=np.float32)
+                    for idx in range(self.num_docs_to_select_from)
             }),
             # The user engaging in this timestep/episode.
-            "user": gym.spaces.Box(0.0, 1.0, shape=(self.num_categories,), dtype=np.float32),
+            "user": gym.spaces.Box(-1.0, 1.0, shape=(self.num_categories,), dtype=np.float32),
             # For each item in the previous slate, was it clicked? If yes, how
             # long was it being engaged with (e.g. watched)?
             "response": gym.spaces.Tuple([
@@ -78,67 +82,73 @@ class RecommSys001(gym.Env):
         # Pick from a only-once-sampled user DB.
         if self.num_users_in_db is not None:
             if self.users_db is None:
-                self.users_db = [softmax(np.random.normal(scale=2.0, size=(self.num_categories,))) for _ in range(self.num_users_in_db)]
+                self.users_db = [np.random.uniform(-1, 1, size=(self.num_categories,))
+                                 for _ in range(self.num_users_in_db)]
             self.current_user = self.users_db[np.random.choice(self.num_users_in_db)]
         # Pick from an infinite pool of users.
         else:
-            self.current_user = softmax(np.random.normal(scale=2.0, size=(self.num_categories,)))
+            self.current_user = np.random.uniform(-1, 1, size=(self.num_categories,))
 
         return self._get_obs()
 
     def step(self, action):
         # Action is the suggested slate (indices of the docs in the suggested ones).
 
+        scores = [np.dot(self.current_user, doc)
+                  for doc in self.currently_suggested_docs]
+        best_reward = np.max(scores)
+
         # User choice model: User picks a doc stochastically,
         # where probs are dot products between user- and doc feature
-        # (categories) vectors. There is also a no-click doc for which all features
-        # are 0.5.
-        user_doc_overlaps = [
-            np.dot(self.current_user, self.currently_suggested_docs[str(doc_idx)])
-            for doc_idx in action
-        ] + [np.dot(self.current_user, np.array([1.0 / self.num_categories for _ in range(self.num_categories)]))]
-
+        # (categories) vectors (rewards).
+        # There is also a no-click doc whose weight is 0.0.
+        user_doc_overlaps = np.array([scores[a] for a in action] + [0.0])
         which_clicked = np.random.choice(
-            np.arange(self.slate_size + 1),
-            p=softmax(np.array(user_doc_overlaps) * 10.0),  # TODO explain why *x -> lower temperature of distribution
-        )
+            np.arange(self.slate_size + 1), p=softmax(user_doc_overlaps))
 
         # Reward is the overlap, if clicked. 0.0 if nothing clicked.
-        reward = 0.0
-
+        r = 0.0
         # If anything clicked, deduct from the current user's time budget and compute
         # reward.
         if which_clicked < self.slate_size:
-            reward = user_doc_overlaps[which_clicked]
+            regret = best_reward - user_doc_overlaps[which_clicked]
+            r = 1 - regret
             self.current_user_budget -= 1.0
-        done = self.current_user_budget <= 0.0
+        d = self.current_user_budget <= 0.0
 
         # Compile response.
         response = tuple({
             "click": int(idx == which_clicked),
-            "engagement": reward if idx == which_clicked else 0.0,
+            "engagement": r if idx == which_clicked else 0.0,
         } for idx in range(len(user_doc_overlaps) - 1))
 
-        return self._get_obs(response=response), reward, done, {}
+        return self._get_obs(response=response), r, d, {}
 
     def _get_obs(self, response=None):
         # Sample D docs from infinity or our pre-existing docs.
         # Pick from a only-once-sampled docs DB.
         if self.num_docs_in_db is not None:
             if self.docs_db is None:
-                self.docs_db = [softmax(np.random.normal(scale=2.0, size=(self.num_categories,))) for _ in range(self.num_docs_in_db)]
-            self.currently_suggested_docs = {
-                str(i): self.docs_db[doc_idx].astype(np.float32) for i, doc_idx in enumerate(np.random.choice(self.num_docs_in_db, size=(self.num_docs_to_select_from,), replace=False))
-            }
+                self.docs_db = [np.random.uniform(-1, 1, size=(self.num_categories,))
+                                for _ in range(self.num_docs_in_db)]
+            self.currently_suggested_docs = [
+                self.docs_db[doc_idx].astype(np.float32)
+                for doc_idx in np.random.choice(self.num_docs_in_db,
+                                                size=(self.num_docs_to_select_from,),
+                                                replace=False)
+            ]
         # Pick from an infinite pool of docs.
         else:
-            self.currently_suggested_docs = {
-                str(idx): softmax(np.random.normal(scale=2.0, size=(self.num_categories,))).astype(np.float32) for idx in range(self.num_docs_to_select_from)
-            }
+            self.currently_suggested_docs = [
+                np.random.uniform(-1, 1, size=(self.num_categories,)).astype(np.float32)
+                for _ in range(self.num_docs_to_select_from)
+            ]
 
         return {
             "user": self.current_user.astype(np.float32),
-            "doc": self.currently_suggested_docs,
+            "doc": {
+                str(idx): doc for idx, doc in enumerate(self.currently_suggested_docs)
+            },
             "response": response if response else self.observation_space["response"].sample()
         }
 
@@ -160,11 +170,11 @@ def get_smart_action(obs):
 
 if __name__ == "__main__":
     env = RecommSys001(
-        num_categories=2,
+        num_categories=20,
         num_docs_to_select_from=10,
         slate_size=1,
         num_docs_in_db=100,
-        num_users_in_db=100,
+        num_users_in_db=1,
     )
     obs = env.reset()
     num_episodes = 0
@@ -172,7 +182,7 @@ if __name__ == "__main__":
     episode_reward = 0.0
 
     while num_episodes < 100:
-        #action = get_smart_action(obs)
+        # action = get_smart_action(obs)
         action = env.action_space.sample()
         obs, reward, done, _ = env.step(action)
 

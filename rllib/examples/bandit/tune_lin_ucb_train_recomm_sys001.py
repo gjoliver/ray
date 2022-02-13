@@ -12,29 +12,34 @@ from ray.rllib.env.wrappers.recsim import MultiDiscreteToDiscreteActionWrapper, 
 
 
 if __name__ == "__main__":
-    ray.init()
+    ray.init(local_mode=True)
 
     tune.register_env("my_env",
-                      lambda config: RecSimObservationBanditWrapper(MultiDiscreteToDiscreteActionWrapper(RecommSys001(**config))))
+                      lambda config: RecSimObservationBanditWrapper(
+                          MultiDiscreteToDiscreteActionWrapper(
+                              RecommSys001(**config))))
 
     config = {
         # Use our RLlib in-house "RecommSys001".
         "env": "my_env",
         "env_config": {
-            "num_categories": 2,
+            "num_categories": 20,
             "num_docs_to_select_from": 10,
             "slate_size": 1,
             "num_docs_in_db": 100,
-            "num_users_in_db": 100,
+            "num_users_in_db": 1,
         },
+        "evaluation_interval": 20,
+        "evaluation_duration": 100,
+        "evaluation_duration_unit": "episodes",
+
+        "simple_optimizer": True,
+        "timesteps_per_iteration": 1,
     }
 
     stop = {
-        #"episode_reward_mean": 20.0,
-        "timesteps_total": 1000000,
+        "timesteps_total": 300,
     }
-
-    #print("Running training for %s time steps" % training_iterations)
 
     start_time = time.time()
     analysis = tune.run(

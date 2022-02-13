@@ -84,7 +84,6 @@ class RecSimObservationBanditWrapper(gym.ObservationWrapper):
         self.observation_space = Dict(
             OrderedDict(
                 [
-                    ("user", obs_space["user"]),
                     (
                         "item",
                         gym.spaces.Box(
@@ -92,7 +91,6 @@ class RecSimObservationBanditWrapper(gym.ObservationWrapper):
                             high=np.ones((num_items, embedding_dim)),
                         ),
                     ),
-                    ("response", obs_space["response"]),
                 ]
             )
         )
@@ -100,9 +98,7 @@ class RecSimObservationBanditWrapper(gym.ObservationWrapper):
 
     def observation(self, obs):
         new_obs = OrderedDict()
-        new_obs["user"] = obs["user"]
         new_obs["item"] = np.vstack(list(obs["doc"].values()))
-        new_obs["response"] = obs["response"]
         new_obs = convert_element_to_space_type(new_obs, self._sampled_obs)
         return new_obs
 
