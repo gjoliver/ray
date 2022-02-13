@@ -1,7 +1,7 @@
 cloud_id: {{env["ANYSCALE_CLOUD_ID"]}}
 region: us-west-2
 
-max_workers: 12
+max_workers: 25
 
 head_node_type:
     name: head_node
@@ -13,7 +13,6 @@ worker_node_types:
       min_workers: 12
       max_workers: 12
       use_spot: false
-worker_node_types:
     - name: worker_node_cpu
       instance_type: m5.2xlarge
       min_workers: 2
