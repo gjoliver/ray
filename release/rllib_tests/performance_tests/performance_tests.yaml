@@ -1,7 +1,7 @@
 appo-pongnoframeskip-v4:
     env: PongNoFrameskip-v4
     run: APPO
-    frameworks: [ "tf2" ]
+    frameworks: [ "torch" ]
     stop:
         time_total_s: 900
     config:
