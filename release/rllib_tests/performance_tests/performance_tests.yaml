@@ -3,7 +3,7 @@ appo-pongnoframeskip-v4:
     run: APPO
     frameworks: [ "torch" ]
     stop:
-        time_total_s: 900
+        time_total_s: 1800
     config:
         vtrace: True
         use_kl_loss: False
