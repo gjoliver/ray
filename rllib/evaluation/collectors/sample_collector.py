@@ -30,7 +30,6 @@ class SampleCollector(metaclass=ABCMeta):
 
     def __init__(self,
                  policy_map: PolicyMap,
-                 clip_rewards: Union[bool, float],
                  callbacks: "DefaultCallbacks",
                  multiple_episodes_in_batch: bool = True,
                  rollout_fragment_length: int = 200,
@@ -39,8 +38,6 @@ class SampleCollector(metaclass=ABCMeta):
 
         Args:
             policy_map (PolicyMap): Maps policy ids to policy instances.
-            clip_rewards (Union[bool, float]): Whether to clip rewards before
-                postprocessing (at +/-1.0) or the actual value to +/- clip.
             callbacks (DefaultCallbacks): RLlib callbacks.
             multiple_episodes_in_batch (bool): Whether it's allowed to pack
                 multiple episodes into the same built batch.
@@ -49,7 +46,6 @@ class SampleCollector(metaclass=ABCMeta):
         """
 
         self.policy_map = policy_map
-        self.clip_rewards = clip_rewards
         self.callbacks = callbacks
         self.multiple_episodes_in_batch = multiple_episodes_in_batch
         self.rollout_fragment_length = rollout_fragment_length
@@ -172,38 +168,14 @@ class SampleCollector(metaclass=ABCMeta):
         raise NotImplementedError
 
     @abstractmethod
-    def get_inference_input_dict(self, policy_id: PolicyID) -> \
-            Dict[str, TensorType]:
-        """Returns an input_dict for an (inference) forward pass from our data.
-
-        The input_dict can then be used for action computations inside a
-        Policy via `Policy.compute_actions_from_input_dict()`.
-
-        Args:
-            policy_id (PolicyID): The Policy ID to get the input dict for.
-
-        Returns:
-            Dict[str, TensorType]: The input_dict to be passed into the ModelV2
-                for inference/training.
-
-        Examples:
-            >>> obs, r, done, info = env.step(action)
-            >>> collector.add_action_reward_next_obs(12345, 0, "pol0", {
-            ...     "action": action, "obs": obs, "reward": r, "done": done
-            ... })
-            >>> input_dict = collector.get_inference_input_dict(policy.model)
-            >>> action = policy.compute_actions_from_input_dict(input_dict)
-            >>> # repeat
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def postprocess_episode(self,
-                            episode: Episode,
-                            is_done: bool = False,
-                            check_dones: bool = False,
-                            build: bool = False) -> Optional[MultiAgentBatch]:
-        """Postprocesses all agents' trajectories in a given episode.
+    def build_sample_batch_from_episode(
+        self,
+        episode: Episode,
+        is_done: bool = False,
+        check_dones: bool = False,
+        build: bool = False
+    ) -> Optional[MultiAgentBatch]:
+        """Postprocess and build all agents' trajectories in a given episode.
 
         Generates (single-trajectory) SampleBatches for all Policies/Agents and
         calls Policy.postprocess_trajectory on each of these. Postprocessing
@@ -236,7 +208,7 @@ class SampleCollector(metaclass=ABCMeta):
         raise NotImplementedError
 
     @abstractmethod
-    def try_build_truncated_episode_multi_agent_batch(self) -> \
+    def try_build_multi_agent_batch_from_truncated_episode(self) -> \
             List[Union[MultiAgentBatch, SampleBatch]]:
         """Tries to build an MA-batch, if `rollout_fragment_length` is reached.
 

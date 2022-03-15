@@ -1,18 +1,31 @@
 import logging
 
+import gym
 import numpy as np
 from typing import Dict, Optional
 
 import ray
+from ray.rllib.agents.dreamer.dreamer_model import DreamerModel
 from ray.rllib.agents.dreamer.utils import FreezeParameters
 from ray.rllib.evaluation.episode import Episode
 from ray.rllib.models.catalog import ModelCatalog
+from ray.rllib.connectors.connector import get_connector
 from ray.rllib.policy.policy import Policy
-from ray.rllib.policy.policy_template import build_policy_class
+from ray.rllib.policy.torch_policy import TorchPolicy
 from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.policy.view_requirement import ViewRequirement
+from ray.rllib.utils.annotations import override
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.torch_utils import apply_grad_clipping
-from ray.rllib.utils.typing import AgentID
+from ray.rllib.utils.typing import (
+    AgentID,
+    GradInfoDict,
+    ModelGradients,
+    ModelWeights,
+    TensorType,
+    TensorStructType,
+    TrainerConfigDict,
+)
 
 torch, nn = try_import_torch()
 if torch:
@@ -180,22 +193,6 @@ def dreamer_loss(policy, model, dist_class, train_batch):
     return (loss_dict["model_loss"], loss_dict["actor_loss"], loss_dict["critic_loss"])
 
 
-def build_dreamer_model(policy, obs_space, action_space, config):
-
-    model = ModelCatalog.get_model_v2(
-        obs_space,
-        action_space,
-        1,
-        config["dreamer_model"],
-        name="DreamerModel",
-        framework="torch",
-    )
-
-    policy.model_variables = model.variables()
-
-    return model
-
-
 def action_sampler_fn(policy, model, input_dict, state, explore, timestep):
     """Action sampler function has two phases. During the prefill phase,
     actions are sampled uniformly [-1, 1]. During training phase, actions
@@ -224,71 +221,118 @@ def action_sampler_fn(policy, model, input_dict, state, explore, timestep):
     return action, logp, state
 
 
-def dreamer_stats(policy, train_batch):
-    return policy.stats_dict
+class DreamerTorchPolicy(TorchPolicy):
+    def __init__(
+        self,
+        # TODO(jungong) : let's make sure if these are still useful after we
+        # clean up policy. Would make checkpoint and inference much easier
+        # if we don't have to provide these.
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        config: TrainerConfigDict,
+        **kwargs,
+    ):
+        self.config = dict(ray.rllib.agents.dreamer.dreamer.DEFAULT_CONFIG, **config)
 
+        dist_class, num_outputs = ModelCatalog.get_action_dist(
+            action_space, self.config["model"], framework="torch"
+        )
 
-def dreamer_optimizer_fn(policy, config):
-    model = policy.model
-    encoder_weights = list(model.encoder.parameters())
-    decoder_weights = list(model.decoder.parameters())
-    reward_weights = list(model.reward.parameters())
-    dynamics_weights = list(model.dynamics.parameters())
-    actor_weights = list(model.actor.parameters())
-    critic_weights = list(model.value.parameters())
-    model_opt = torch.optim.Adam(
-        encoder_weights + decoder_weights + reward_weights + dynamics_weights,
-        lr=config["td_model_lr"],
-    )
-    actor_opt = torch.optim.Adam(actor_weights, lr=config["actor_lr"])
-    critic_opt = torch.optim.Adam(critic_weights, lr=config["critic_lr"])
+        model = DreamerModel(
+            observation_space, action_space, num_outputs, config["dreamer_model"]
+        )
 
-    return (model_opt, actor_opt, critic_opt)
+        super().__init__(observation_space, action_space, self.config,
+                         model=model,
+                         loss=dreamer_loss,
+                         action_distribution_class=dist_class,
+                         action_sampler_fn=action_sampler_fn)
 
+        # view requirements contain all the columns that are used by
+        # either training iteration or action computation.
+        self.view_requirements = {
+            SampleBatch.OBS: ViewRequirement(space=self.observation_space),
+            SampleBatch.NEXT_OBS: ViewRequirement(
+                data_col=SampleBatch.OBS,
+                space=self.observation_space,
+                shift=1,
+                # Both are False, basically meaning we do not have to explicitly
+                # provide this column. But rather, it will get populated by
+                # SampleCollector when building the batch from a complete episode.
+                used_for_training=False,
+                used_for_compute_actions=False
+            ),
+            SampleBatch.ACTIONS: ViewRequirement(
+                space=self.action_space, used_for_compute_actions=False
+            ),
+            SampleBatch.REWARDS: ViewRequirement(used_for_compute_actions=False),
+            SampleBatch.DONES: ViewRequirement(used_for_compute_actions=False),
+            SampleBatch.INFOS: ViewRequirement(used_for_compute_actions=False),
+            # These field are useful when we have to split a SampleBatch at
+            # episode boundaries for training purpose.
+            SampleBatch.EPS_ID: ViewRequirement(used_for_compute_actions=False),
+            SampleBatch.UNROLL_ID: ViewRequirement(used_for_compute_actions=False),
+            SampleBatch.AGENT_INDEX: ViewRequirement(used_for_compute_actions=False),
+        }
 
-def preprocess_episode(
-    policy: Policy,
-    sample_batch: SampleBatch,
-    other_agent_batches: Optional[Dict[AgentID, SampleBatch]] = None,
-    episode: Optional[Episode] = None,
-) -> SampleBatch:
-    """Batch format should be in the form of (s_t, a_(t-1), r_(t-1))
-    When t=0, the resetted obs is paired with action and reward of 0.
-    """
-    obs = sample_batch[SampleBatch.OBS]
-    new_obs = sample_batch[SampleBatch.NEXT_OBS]
-    action = sample_batch[SampleBatch.ACTIONS]
-    reward = sample_batch[SampleBatch.REWARDS]
-    eps_ids = sample_batch[SampleBatch.EPS_ID]
+        # If our model requires internal state inputs / outputs, we will
+        # add the view requirements here.
+        self._update_model_view_requirements_from_init_state()
 
-    act_shape = action.shape
-    act_reset = np.array([0.0] * act_shape[-1])[None]
-    rew_reset = np.array(0.0)[None]
-    obs_end = np.array(new_obs[act_shape[0] - 1])[None]
+    @override(TorchPolicy)
+    def extra_grad_info(self, train_batch):
+        with self._no_grad_context():
+            return self._convert_to_numpy(self.stats_dict)
 
-    batch_obs = np.concatenate([obs, obs_end], axis=0)
-    batch_action = np.concatenate([act_reset, action], axis=0)
-    batch_rew = np.concatenate([rew_reset, reward], axis=0)
-    batch_eps_ids = np.concatenate([eps_ids, eps_ids[-1:]], axis=0)
+    @override(TorchPolicy)
+    def optimizer(self):
+        model = self.model
+        encoder_weights = list(model.encoder.parameters())
+        decoder_weights = list(model.decoder.parameters())
+        reward_weights = list(model.reward.parameters())
+        dynamics_weights = list(model.dynamics.parameters())
+        actor_weights = list(model.actor.parameters())
+        critic_weights = list(model.value.parameters())
+        model_opt = torch.optim.Adam(
+            encoder_weights + decoder_weights + reward_weights + dynamics_weights,
+            lr=self.config["td_model_lr"],
+        )
+        actor_opt = torch.optim.Adam(actor_weights, lr=self.config["actor_lr"])
+        critic_opt = torch.optim.Adam(critic_weights, lr=self.config["critic_lr"])
 
-    new_batch = {
-        SampleBatch.OBS: batch_obs,
-        SampleBatch.REWARDS: batch_rew,
-        SampleBatch.ACTIONS: batch_action,
-        SampleBatch.EPS_ID: batch_eps_ids,
-    }
-    return SampleBatch(new_batch)
+        return model_opt, actor_opt, critic_opt
 
+    @override(TorchPolicy)
+    def extra_grad_process(self, optimizer, loss):
+        return apply_grad_clipping(self, optimizer, loss)
 
-DreamerTorchPolicy = build_policy_class(
-    name="DreamerTorchPolicy",
-    framework="torch",
-    get_default_config=lambda: ray.rllib.agents.dreamer.dreamer.DEFAULT_CONFIG,
-    action_sampler_fn=action_sampler_fn,
-    postprocess_fn=preprocess_episode,
-    loss_fn=dreamer_loss,
-    stats_fn=dreamer_stats,
-    make_model=build_dreamer_model,
-    optimizer_fn=dreamer_optimizer_fn,
-    extra_grad_process_fn=apply_grad_clipping,
-)
+    @override(Policy)
+    def postprocess_trajectory(
+        self, sample_batch, other_agent_batches=None, episode=None
+    ):
+        """Batch format should be in the form of (s_t, a_(t-1), r_(t-1))
+        When t=0, the resetted obs is paired with action and reward of 0.
+        """
+        obs = sample_batch[SampleBatch.OBS]
+        new_obs = sample_batch[SampleBatch.NEXT_OBS]
+        action = sample_batch[SampleBatch.ACTIONS]
+        reward = sample_batch[SampleBatch.REWARDS]
+        eps_ids = sample_batch[SampleBatch.EPS_ID]
+
+        act_shape = action.shape
+        act_reset = np.array([0.0] * act_shape[-1])[None]
+        rew_reset = np.array(0.0)[None]
+        obs_end = np.array(new_obs[act_shape[0] - 1])[None]
+
+        batch_obs = np.concatenate([obs, obs_end], axis=0)
+        batch_action = np.concatenate([act_reset, action], axis=0)
+        batch_rew = np.concatenate([rew_reset, reward], axis=0)
+        batch_eps_ids = np.concatenate([eps_ids, eps_ids[-1:]], axis=0)
+
+        new_batch = {
+            SampleBatch.OBS: batch_obs,
+            SampleBatch.REWARDS: batch_rew,
+            SampleBatch.ACTIONS: batch_action,
+            SampleBatch.EPS_ID: batch_eps_ids,
+        }
+        return SampleBatch(new_batch)

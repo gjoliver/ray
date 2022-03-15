@@ -246,10 +246,6 @@ class TorchPolicy(Policy):
 
         self._state_inputs = self.model.get_initial_state()
         self._is_recurrent = len(self._state_inputs) > 0
-        # Auto-update model's inference view requirements, if recurrent.
-        self._update_model_view_requirements_from_init_state()
-        # Combine view_requirements for Model and Policy.
-        self.view_requirements.update(self.model.view_requirements)
 
         self.exploration = self._create_exploration()
         self.unwrapped_model = model  # used to support DistributedDataParallel
@@ -1021,7 +1017,7 @@ class TorchPolicy(Policy):
         # Update our global timestep by the batch size.
         self.global_timestep += len(input_dict[SampleBatch.CUR_OBS])
 
-        return convert_to_numpy((actions, state_out, extra_fetches))
+        return actions, state_out, extra_fetches
 
     def _lazy_tensor_dict(self, postprocessed_batch: SampleBatch, device=None):
         # TODO: (sven): Keep for a while to ensure backward compatibility.

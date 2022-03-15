@@ -71,10 +71,30 @@ DEFAULT_CONFIG = with_common_config({
         # Action STD
         "action_init_std": 5.0,
     },
-
     "env_config": {
         # Repeats action send by policy for frame_skip times in env
         "frame_skip": 2,
+    },
+    "connector_cfg": {
+        "default_agent": (
+            "AgentConnectorPipeline", [
+                ("StateBufferConnector", None),
+                ("ViewRequirementConnector", None)
+            ]
+        ),
+        "default_action": (
+            "ActionConnectorPipeline", [
+                ("ConvertToNumpyConnector", None),
+                ("NormalizeActionsConnector", None)
+            ]
+        ),
+    },
+    # Note(jungong) : for multiagent, connectors setting should be configured each policy.
+    "policy_config": {
+        "connectors": {
+            "agent": "default_agent",
+            "action": "default_action",
+        }
     }
 })
 # __sphinx_doc_end__

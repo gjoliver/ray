@@ -244,6 +244,7 @@ COMMON_CONFIG: TrainerConfigDict = {
     # Set to False for not recording anything.
     # Note: This setting replaces the deprecated `monitor` key.
     "record_env": False,
+    ############ TODO(jungong) : start: these should belong to policy_cfg
     # Whether to clip rewards during Policy's postprocessing.
     # None (default): Clip for Atari only (r=sign(r)).
     # True: r=sign(r): Fixed rewards -1.0, 1.0, or 0.0.
@@ -260,6 +261,7 @@ COMMON_CONFIG: TrainerConfigDict = {
     # before sending them back to the env.
     # TODO: (sven) This option should be obsoleted and always be False.
     "clip_actions": False,
+    ############ TODO(jungong) : end clean up.
     # Whether to use "rllib" or "deepmind" preprocessors by default
     # Set to None for using no preprocessor. In this case, the model will have
     # to handle possibly complex observations from the environment.
@@ -577,10 +579,12 @@ COMMON_CONFIG: TrainerConfigDict = {
         #   trained only on certain data (e.g. when playing against a certain
         #   opponent).
         "policies_to_train": None,
+        ############# TODO(jungong): start: clean this up with custom input connector.
         # Optional function that can be used to enhance the local agent
         # observations to include more state.
         # See rllib/evaluation/observation_function.py for more info.
         "observation_fn": None,
+        ############# TODO(jungong): end: cleanup.
         # When replay_mode=lockstep, RLlib will replay all the agent
         # transitions at a particular timestep together in a batch. This allows
         # the policy to implement differentiable shared computations between

@@ -322,12 +322,6 @@ def build_policy_class(
                     self, self.observation_space, self.action_space, config
                 )
 
-            # Perform test runs through postprocessing- and loss functions.
-            self._initialize_loss_from_dummy_batch(
-                auto_remove_unneeded_view_reqs=True,
-                stats_fn=None if self.config["in_evaluation"] else stats_fn,
-            )
-
             if _after_loss_init:
                 _after_loss_init(self, obs_space, action_space, config)
 

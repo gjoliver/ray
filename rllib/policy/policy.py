@@ -23,6 +23,7 @@ from ray.actor import ActorHandle
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.models.modelv2 import ModelV2
+from ray.rllib.connectors.util import get_connectors_from_cfg
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy.view_requirement import ViewRequirement
 from ray.rllib.utils.annotations import (
@@ -119,6 +120,7 @@ class Policy(metaclass=ABCMeta):
         self,
         observation_space: gym.Space,
         action_space: gym.Space,
+        # TODO(jungong) : Policy should hopefully only have access to policy_cfg.
         config: TrainerConfigDict,
     ):
         """Initializes a Policy instance.
@@ -138,14 +140,10 @@ class Policy(metaclass=ABCMeta):
         self.action_space_struct = get_base_struct_from_space(action_space)
 
         self.config: TrainerConfigDict = config
-        self.framework = self.config.get("framework")
-        # Create the callbacks object to use for handling custom callbacks.
-        if self.config.get("callbacks"):
-            self.callbacks: "DefaultCallbacks" = self.config.get("callbacks")()
-        else:
-            from ray.rllib.agents.callbacks import DefaultCallbacks
 
-            self.callbacks: "DefaultCallbacks" = DefaultCallbacks()
+        # (jungong) for clarity of prototype, not supporting callbacks for now.
+        from ray.rllib.agents.callbacks import DefaultCallbacks
+        self.callbacks: "DefaultCallbacks" = DefaultCallbacks()
 
         # The global timestep, broadcast down from time to time from the
         # local worker to all remote workers.
@@ -155,21 +153,24 @@ class Policy(metaclass=ABCMeta):
         # Child classes may set this.
         self.dist_class: Optional[Type] = None
 
-        # Maximal view requirements dict for `learn_on_batch()` and
-        # `compute_actions` calls.
-        # View requirements will be automatically filtered out later based
-        # on the postprocessing and loss functions to ensure optimal data
-        # collection and transfer performance.
-        view_reqs = self._get_default_view_requirements()
-        if not hasattr(self, "view_requirements"):
-            self.view_requirements = view_reqs
-        else:
-            for k, v in view_reqs.items():
-                if k not in self.view_requirements:
-                    self.view_requirements[k] = v
-        # Whether the Model's initial state (method) has been added
-        # automatically based on the given view requirements of the model.
-        self._model_init_state_automatically_added = False
+        # Initialize connectors based on static TrainerConfig dict.
+        self._init_connectors()
+
+    @DeveloperAPI
+    def _init_connectors(self):
+        self.agent_connector, self.action_connector = None, None
+
+        # Expand per-policy connector cfg.
+        if "connector_cfg" not in self.config:
+            return
+
+        pc = self.config.get("policy_config", {})
+        if "connectors" not in pc:
+            return
+        pcc = pc["connectors"]
+
+        self.agent_connector = pcc["agent"]
+        self.action_connector = pcc["action"]
 
     @DeveloperAPI
     def compute_single_action(
@@ -465,6 +466,9 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
+    ########################
+    # TODO(jungong): Start should belong to Trainer classes.
+    ########################
     @DeveloperAPI
     def learn_on_batch(self, samples: SampleBatch) -> Dict[str, TensorType]:
         """Perform one learning update, given `samples`.
@@ -594,6 +598,9 @@ class Policy(metaclass=ABCMeta):
             grad_info: Extra policy-specific info values.
         """
         raise NotImplementedError
+    ########################
+    # TODO(jungong): End should belong to Trainer classes.
+    ########################
 
     @DeveloperAPI
     def apply_gradients(self, gradients: ModelGradients) -> None:
@@ -820,306 +827,47 @@ class Policy(metaclass=ABCMeta):
         )
         return exploration
 
+    #############################
+    # TODO(jungong) : start of APIs that can be cleaned up.
+    #############################
     def _get_default_view_requirements(self):
-        """Returns a default ViewRequirements dict.
-
-        Note: This is the base/maximum requirement dict, from which later
-        some requirements will be subtracted again automatically to streamline
-        data collection, batch creation, and data transfer.
-
-        Returns:
-            ViewReqDict: The default view requirements dict.
-        """
-
-        # Default view requirements (equal to those that we would use before
-        # the trajectory view API was introduced).
-        return {
-            SampleBatch.OBS: ViewRequirement(space=self.observation_space),
-            SampleBatch.NEXT_OBS: ViewRequirement(
-                data_col=SampleBatch.OBS, shift=1, space=self.observation_space
-            ),
-            SampleBatch.ACTIONS: ViewRequirement(
-                space=self.action_space, used_for_compute_actions=False
-            ),
-            # For backward compatibility with custom Models that don't specify
-            # these explicitly (will be removed by Policy if not used).
-            SampleBatch.PREV_ACTIONS: ViewRequirement(
-                data_col=SampleBatch.ACTIONS, shift=-1, space=self.action_space
-            ),
-            SampleBatch.REWARDS: ViewRequirement(),
-            # For backward compatibility with custom Models that don't specify
-            # these explicitly (will be removed by Policy if not used).
-            SampleBatch.PREV_REWARDS: ViewRequirement(
-                data_col=SampleBatch.REWARDS, shift=-1
-            ),
-            SampleBatch.DONES: ViewRequirement(),
-            SampleBatch.INFOS: ViewRequirement(),
-            SampleBatch.EPS_ID: ViewRequirement(),
-            SampleBatch.UNROLL_ID: ViewRequirement(),
-            SampleBatch.AGENT_INDEX: ViewRequirement(),
-            "t": ViewRequirement(),
-        }
+        # View requirements are replaced with specialized connector(s).
+        raise NotImplementedError()
 
     def _initialize_loss_from_dummy_batch(
         self,
         auto_remove_unneeded_view_reqs: bool = True,
         stats_fn=None,
     ) -> None:
-        """Performs test calls through policy's model and loss.
-
-        NOTE: This base method should work for define-by-run Policies such as
-        torch and tf-eager policies.
-
-        If required, will thereby detect automatically, which data views are
-        required by a) the forward pass, b) the postprocessing, and c) the loss
-        functions, and remove those from self.view_requirements that are not
-        necessary for these computations (to save data storage and transfer).
-
-        Args:
-            auto_remove_unneeded_view_reqs (bool): Whether to automatically
-                remove those ViewRequirements records from
-                self.view_requirements that are not needed.
-            stats_fn (Optional[Callable[[Policy, SampleBatch], Dict[str,
-                TensorType]]]): An optional stats function to be called after
-                the loss.
-        """
-        # Signal Policy that currently we do not like to eager/jit trace
-        # any function calls. This is to be able to track, which columns
-        # in the dummy batch are accessed by the different function (e.g.
-        # loss) such that we can then adjust our view requirements.
-        self._no_tracing = True
-
-        sample_batch_size = max(self.batch_divisibility_req * 4, 32)
-        self._dummy_batch = self._get_dummy_batch_from_view_requirements(
-            sample_batch_size
-        )
-        self._lazy_tensor_dict(self._dummy_batch)
-        actions, state_outs, extra_outs = self.compute_actions_from_input_dict(
-            self._dummy_batch, explore=False
-        )
-        for key, view_req in self.view_requirements.items():
-            if key not in self._dummy_batch.accessed_keys:
-                view_req.used_for_compute_actions = False
-        # Add all extra action outputs to view reqirements (these may be
-        # filtered out later again, if not needed for postprocessing or loss).
-        for key, value in extra_outs.items():
-            self._dummy_batch[key] = value
-            if key not in self.view_requirements:
-                self.view_requirements[key] = ViewRequirement(
-                    space=gym.spaces.Box(
-                        -1.0, 1.0, shape=value.shape[1:], dtype=value.dtype
-                    ),
-                    used_for_compute_actions=False,
-                )
-        for key in self._dummy_batch.accessed_keys:
-            if key not in self.view_requirements:
-                self.view_requirements[key] = ViewRequirement()
-            self.view_requirements[key].used_for_compute_actions = True
-        self._dummy_batch = self._get_dummy_batch_from_view_requirements(
-            sample_batch_size
-        )
-        self._dummy_batch.set_get_interceptor(None)
-        self.exploration.postprocess_trajectory(self, self._dummy_batch)
-        postprocessed_batch = self.postprocess_trajectory(self._dummy_batch)
-        seq_lens = None
-        if state_outs:
-            B = 4  # For RNNs, have B=4, T=[depends on sample_batch_size]
-            i = 0
-            while "state_in_{}".format(i) in postprocessed_batch:
-                postprocessed_batch["state_in_{}".format(i)] = postprocessed_batch[
-                    "state_in_{}".format(i)
-                ][:B]
-                if "state_out_{}".format(i) in postprocessed_batch:
-                    postprocessed_batch["state_out_{}".format(i)] = postprocessed_batch[
-                        "state_out_{}".format(i)
-                    ][:B]
-                i += 1
-            seq_len = sample_batch_size // B
-            seq_lens = np.array([seq_len for _ in range(B)], dtype=np.int32)
-            postprocessed_batch[SampleBatch.SEQ_LENS] = seq_lens
-        # Switch on lazy to-tensor conversion on `postprocessed_batch`.
-        train_batch = self._lazy_tensor_dict(postprocessed_batch)
-        # Calling loss, so set `is_training` to True.
-        train_batch.set_training(True)
-        if seq_lens is not None:
-            train_batch[SampleBatch.SEQ_LENS] = seq_lens
-        train_batch.count = self._dummy_batch.count
-        # Call the loss function, if it exists.
-        if self._loss is not None:
-            self._loss(self, self.model, self.dist_class, train_batch)
-        # Call the stats fn, if given.
-        if stats_fn is not None:
-            stats_fn(self, train_batch)
-
-        # Re-enable tracing.
-        self._no_tracing = False
-
-        # Add new columns automatically to view-reqs.
-        if auto_remove_unneeded_view_reqs:
-            # Add those needed for postprocessing and training.
-            all_accessed_keys = (
-                train_batch.accessed_keys
-                | self._dummy_batch.accessed_keys
-                | self._dummy_batch.added_keys
-            )
-            for key in all_accessed_keys:
-                if key not in self.view_requirements and key != SampleBatch.SEQ_LENS:
-                    self.view_requirements[key] = ViewRequirement(
-                        used_for_compute_actions=False
-                    )
-            if self._loss:
-                # Tag those only needed for post-processing (with some
-                # exceptions).
-                for key in self._dummy_batch.accessed_keys:
-                    if (
-                        key not in train_batch.accessed_keys
-                        and key in self.view_requirements
-                        and key not in self.model.view_requirements
-                        and key
-                        not in [
-                            SampleBatch.EPS_ID,
-                            SampleBatch.AGENT_INDEX,
-                            SampleBatch.UNROLL_ID,
-                            SampleBatch.DONES,
-                            SampleBatch.REWARDS,
-                            SampleBatch.INFOS,
-                        ]
-                    ):
-                        self.view_requirements[key].used_for_training = False
-                # Remove those not needed at all (leave those that are needed
-                # by Sampler to properly execute sample collection).
-                # Also always leave DONES, REWARDS, INFOS, no matter what.
-                for key in list(self.view_requirements.keys()):
-                    if (
-                        key not in all_accessed_keys
-                        and key
-                        not in [
-                            SampleBatch.EPS_ID,
-                            SampleBatch.AGENT_INDEX,
-                            SampleBatch.UNROLL_ID,
-                            SampleBatch.DONES,
-                            SampleBatch.REWARDS,
-                            SampleBatch.INFOS,
-                        ]
-                        and key not in self.model.view_requirements
-                    ):
-                        # If user deleted this key manually in postprocessing
-                        # fn, warn about it and do not remove from
-                        # view-requirements.
-                        if key in self._dummy_batch.deleted_keys:
-                            logger.warning(
-                                "SampleBatch key '{}' was deleted manually in "
-                                "postprocessing function! RLlib will "
-                                "automatically remove non-used items from the "
-                                "data stream. Remove the `del` from your "
-                                "postprocessing function.".format(key)
-                            )
-                        # If we are not writing output to disk, save to erase
-                        # this key to save space in the sample batch.
-                        elif self.config["output"] is None:
-                            del self.view_requirements[key]
+        # We should not need dummy_batch dry-run with
+        # the new policy.
+        raise NotImplementedError()
 
     def _get_dummy_batch_from_view_requirements(
         self, batch_size: int = 1
     ) -> SampleBatch:
-        """Creates a numpy dummy batch based on the Policy's view requirements.
-
-        Args:
-            batch_size (int): The size of the batch to create.
-
-        Returns:
-            Dict[str, TensorType]: The dummy batch containing all zero values.
-        """
-        ret = {}
-        for view_col, view_req in self.view_requirements.items():
-            data_col = view_req.data_col or view_col
-            # Flattened dummy batch.
-            if (isinstance(view_req.space, (gym.spaces.Tuple, gym.spaces.Dict))) and (
-                (
-                    data_col == SampleBatch.OBS
-                    and not self.config["_disable_preprocessor_api"]
-                )
-                or (
-                    data_col == SampleBatch.ACTIONS
-                    and not self.config.get("_disable_action_flattening")
-                )
-            ):
-                _, shape = ModelCatalog.get_action_shape(
-                    view_req.space, framework=self.config["framework"]
-                )
-                ret[view_col] = np.zeros((batch_size,) + shape[1:], np.float32)
-            # Non-flattened dummy batch.
-            else:
-                # Range of indices on time-axis, e.g. "-50:-1".
-                if view_req.shift_from is not None:
-                    ret[view_col] = get_dummy_batch_for_space(
-                        view_req.space,
-                        batch_size=batch_size,
-                        time_size=view_req.shift_to - view_req.shift_from + 1,
-                    )
-                # Sequence of (probably non-consecutive) indices.
-                elif isinstance(view_req.shift, (list, tuple)):
-                    ret[view_col] = get_dummy_batch_for_space(
-                        view_req.space,
-                        batch_size=batch_size,
-                        time_size=len(view_req.shift),
-                    )
-                # Single shift int value.
-                else:
-                    if isinstance(view_req.space, gym.spaces.Space):
-                        ret[view_col] = get_dummy_batch_for_space(
-                            view_req.space, batch_size=batch_size, fill_value=0.0
-                        )
-                    else:
-                        ret[view_col] = [view_req.space for _ in range(batch_size)]
-
-        # Due to different view requirements for the different columns,
-        # columns in the resulting batch may not all have the same batch size.
-        return SampleBatch(ret)
+        # We should not need dummy_batch dry-run with
+        # the new policy.
+        raise NotImplementedError()
+    #############################
+    # TODO(jungong) : end of APIs that can be cleaned up.
+    #############################
 
     def _update_model_view_requirements_from_init_state(self):
-        """Uses Model's (or this Policy's) init state to add needed ViewReqs.
-
+        """Uses Model's init state to add needed ViewReqs.
         Can be called from within a Policy to make sure RNNs automatically
         update their internal state-related view requirements.
         Changes the `self.view_requirements` dict.
         """
         self._model_init_state_automatically_added = True
-        model = getattr(self, "model", None)
 
-        obj = model or self
-        if model and not hasattr(model, "view_requirements"):
-            model.view_requirements = {
-                SampleBatch.OBS: ViewRequirement(space=self.observation_space)
-            }
-        view_reqs = obj.view_requirements
         # Add state-ins to this model's view.
         init_state = []
-        if hasattr(obj, "get_initial_state") and callable(obj.get_initial_state):
-            init_state = obj.get_initial_state()
-        else:
-            # Add this functionality automatically for new native model API.
-            if (
-                tf
-                and isinstance(model, tf.keras.Model)
-                and "state_in_0" not in view_reqs
-            ):
-                obj.get_initial_state = lambda: [
-                    np.zeros_like(view_req.space.sample())
-                    for k, view_req in model.view_requirements.items()
-                    if k.startswith("state_in_")
-                ]
-            else:
-                obj.get_initial_state = lambda: []
-                if "state_in_0" in view_reqs:
-                    self.is_recurrent = lambda: True
+        model = getattr(self, "model", None)
+        if model and hasattr(model, "get_initial_state") and callable(model.get_initial_state):
+            init_state = model.get_initial_state()
 
-        # Make sure auto-generated init-state view requirements get added
-        # to both Policy and Model, no matter what.
-        view_reqs = [view_reqs] + (
-            [self.view_requirements] if hasattr(self, "view_requirements") else []
-        )
-
+        view_reqs = self.view_requirements
         for i, state in enumerate(init_state):
             # Allow `state` to be either a Space (use zeros as initial values)
             # or any value (e.g. a dict or a non-zero tensor).
@@ -1136,25 +884,25 @@ class Policy(metaclass=ABCMeta):
                 )
             else:
                 space = state
-            for vr in view_reqs:
-                # Only override if user has not already provided
-                # custom view-requirements for state_in_n.
-                if "state_in_{}".format(i) not in vr:
-                    vr["state_in_{}".format(i)] = ViewRequirement(
-                        "state_out_{}".format(i),
-                        shift=-1,
-                        used_for_compute_actions=True,
-                        batch_repeat_value=self.config.get("model", {}).get(
-                            "max_seq_len", 1
-                        ),
-                        space=space,
-                    )
-                # Only override if user has not already provided
-                # custom view-requirements for state_out_n.
-                if "state_out_{}".format(i) not in vr:
-                    vr["state_out_{}".format(i)] = ViewRequirement(
-                        space=space, used_for_training=True
-                    )
+
+            # Only override if user has not already provided
+            # custom view-requirements for state_in_n.
+            if "state_in_{}".format(i) not in view_reqs:
+                view_reqs["state_in_{}".format(i)] = ViewRequirement(
+                    "state_out_{}".format(i),
+                    shift=-1,
+                    used_for_compute_actions=True,
+                    batch_repeat_value=self.config.get("model", {}).get(
+                        "max_seq_len", 1
+                    ),
+                    space=space,
+                )
+            # Only override if user has not already provided
+            # custom view-requirements for state_out_n.
+            if "state_out_{}".format(i) not in view_reqs:
+                view_reqs["state_out_{}".format(i)] = ViewRequirement(
+                    space=space, used_for_training=True, used_for_compute_actions=False,
+                )
 
     @DeveloperAPI
     def __repr__(self):

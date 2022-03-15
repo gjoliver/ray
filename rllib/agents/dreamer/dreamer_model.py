@@ -1,7 +1,6 @@
 import numpy as np
 from typing import Any, List, Tuple
 from ray.rllib.models.torch.misc import Reshape
-from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.framework import TensorType
 
@@ -460,11 +459,15 @@ class RSSM(nn.Module):
 
 
 # Represents all models in Dreamer, unifies them all into a single interface
-class DreamerModel(TorchModelV2, nn.Module):
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
-        super().__init__(obs_space, action_space, num_outputs, model_config, name)
-
+class DreamerModel(nn.Module):
+    def __init__(self, obs_space, action_space, num_outputs, model_config):
         nn.Module.__init__(self)
+
+        self.obs_space: Space = obs_space
+        self.action_space: Space = action_space
+        self.num_outputs: int = num_outputs
+        self.model_config: ModelConfigDict = model_config
+
         self.depth = model_config["depth_size"]
         self.deter_size = model_config["deter_size"]
         self.stoch_size = model_config["stoch_size"]

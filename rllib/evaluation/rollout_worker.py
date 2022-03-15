@@ -23,6 +23,7 @@ from typing import (
 import ray
 from ray import ObjectRef
 from ray import cloudpickle as pickle
+from ray.rllib.connectors.util import get_connectors_from_cfg
 from ray.rllib.env.base_env import BaseEnv, convert_to_base_env
 from ray.rllib.env.env_context import EnvContext
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
@@ -310,9 +311,6 @@ class RolloutWorker(ParallelIteratorWorker):
                 if the env already implements VectorEnv.
             observation_fn: Optional multi-agent observation function.
             observation_filter: Name of observation filter to use.
-            clip_rewards: True for clipping rewards to [-1.0, 1.0] prior
-                to experience postprocessing. None: Clip for Atari only.
-                float: Clip to [-clip_rewards; +clip_rewards].
             normalize_actions: Whether to normalize actions to the
                 action space's bounds.
             clip_actions: Whether to clip action values to the range
@@ -530,11 +528,6 @@ class RolloutWorker(ParallelIteratorWorker):
                 # Deepmind wrappers already handle all preprocessing.
                 self.preprocessing_enabled = False
 
-                # If clip_rewards not explicitly set to False, switch it
-                # on here (clip between -1.0 and 1.0).
-                if clip_rewards is None:
-                    clip_rewards = True
-
                 # Framestacking is used.
                 use_framestack = model_config.get("framestack") is True
 
@@ -568,6 +561,11 @@ class RolloutWorker(ParallelIteratorWorker):
             self.make_sub_env_fn = self._get_make_sub_env_fn(
                 env_creator, env_context, validate_env, wrap, seed
             )
+
+        if "connector_cfg" in policy_config:
+            self.connectors = get_connectors_from_cfg(policy_config["connector_cfg"])
+        else:
+            self.connectors = None
 
         self.spaces = spaces
 
@@ -634,14 +632,6 @@ class RolloutWorker(ParallelIteratorWorker):
             session_creator=tf_session_creator,
             seed=seed,
         )
-
-        # Update Policy's view requirements from Model, only if Policy directly
-        # inherited from base `Policy` class. At this point here, the Policy
-        # must have it's Model (if any) defined and ready to output an initial
-        # state.
-        for pol in self.policy_map.values():
-            if not pol._model_init_state_automatically_added:
-                pol._update_model_view_requirements_from_init_state()
 
         self.multiagent: bool = set(self.policy_map.keys()) != {DEFAULT_POLICY_ID}
         if self.multiagent and self.env is not None:
@@ -742,14 +732,11 @@ class RolloutWorker(ParallelIteratorWorker):
             self.sampler = AsyncSampler(
                 worker=self,
                 env=self.async_env,
-                clip_rewards=clip_rewards,
                 rollout_fragment_length=rollout_fragment_length,
                 count_steps_by=count_steps_by,
                 callbacks=self.callbacks,
                 horizon=episode_horizon,
                 multiple_episodes_in_batch=pack,
-                normalize_actions=normalize_actions,
-                clip_actions=clip_actions,
                 blackhole_outputs="simulation" in input_evaluation,
                 soft_horizon=soft_horizon,
                 no_done_at_end=no_done_at_end,
@@ -763,14 +750,11 @@ class RolloutWorker(ParallelIteratorWorker):
             self.sampler = SyncSampler(
                 worker=self,
                 env=self.async_env,
-                clip_rewards=clip_rewards,
                 rollout_fragment_length=rollout_fragment_length,
                 count_steps_by=count_steps_by,
                 callbacks=self.callbacks,
                 horizon=episode_horizon,
                 multiple_episodes_in_batch=pack,
-                normalize_actions=normalize_actions,
-                clip_actions=clip_actions,
                 soft_horizon=soft_horizon,
                 no_done_at_end=no_done_at_end,
                 observation_fn=observation_fn,
@@ -1474,6 +1458,14 @@ class RolloutWorker(ParallelIteratorWorker):
         return return_filters
 
     @DeveloperAPI
+    def serialize_connectors(self):
+        if not self.connectors:
+            return None
+        return {
+            k: c.to_config() for k, c in self.connectors.items()
+        }
+
+    @DeveloperAPI
     def save(self) -> bytes:
         """Serializes this RolloutWorker's current state and returns it.
 
@@ -1481,7 +1473,6 @@ class RolloutWorker(ParallelIteratorWorker):
             The current state of this RolloutWorker as a serialized, pickled
             byte sequence.
         """
-        filters = self.get_filters(flush_after=True)
         state = {}
         policy_specs = {}
         for pid in self.policy_map:
@@ -1489,11 +1480,19 @@ class RolloutWorker(ParallelIteratorWorker):
             policy_specs[pid] = self.policy_map.policy_specs[pid]
         return pickle.dumps(
             {
-                "filters": filters,
                 "state": state,
                 "policy_specs": policy_specs,
+                "connectors": self.serialize_connectors(),
             }
         )
+
+    @DeveloperAPI
+    def deserialize_connectors(self, config):
+        if not config:
+            return None
+        return {
+            k: get_connector(n, p) for k, (n, p) in config
+        }
 
     @DeveloperAPI
     def restore(self, objs: bytes) -> None:
@@ -1511,7 +1510,6 @@ class RolloutWorker(ParallelIteratorWorker):
             >>> new_worker.restore(state) # doctest: +SKIP
         """
         objs = pickle.loads(objs)
-        self.sync_filters(objs["filters"])
         for pid, state in objs["state"].items():
             if pid not in self.policy_map:
                 pol_spec = objs.get("policy_specs", {}).get(pid)
@@ -1532,6 +1530,7 @@ class RolloutWorker(ParallelIteratorWorker):
                     )
             else:
                 self.policy_map[pid].set_state(state)
+        self.connectors = self.deserialize_connectors(objs["connectors"])
 
     @DeveloperAPI
     def get_weights(

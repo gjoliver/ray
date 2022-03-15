@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 
 @DeveloperAPI
 class Episode:
+    """
+    TODO(jungong) : now that we have agent connectors, we probably don't need most of
+    the logics in this Episode class. CLEAN UP.
+    """
     """Tracks the current state of a (possibly multi-agent) episode.
 
     Attributes:
@@ -103,14 +107,10 @@ class Episode:
         self._next_agent_index: int = 0
         self._agent_to_index: Dict[AgentID, int] = {}
         self._agent_to_policy: Dict[AgentID, PolicyID] = {}
-        self._agent_to_rnn_state: Dict[AgentID, List[Any]] = {}
         self._agent_to_last_obs: Dict[AgentID, EnvObsType] = {}
         self._agent_to_last_raw_obs: Dict[AgentID, EnvObsType] = {}
         self._agent_to_last_done: Dict[AgentID, bool] = {}
         self._agent_to_last_info: Dict[AgentID, EnvInfoDict] = {}
-        self._agent_to_last_action: Dict[AgentID, EnvActionType] = {}
-        self._agent_to_last_extra_action_outs: Dict[AgentID, dict] = {}
-        self._agent_to_prev_action: Dict[AgentID, EnvActionType] = {}
         self._agent_reward_history: Dict[AgentID, List[int]] = defaultdict(list)
 
     @DeveloperAPI
@@ -227,80 +227,6 @@ class Episode:
         return self._agent_to_last_info.get(agent_id)
 
     @DeveloperAPI
-    def last_action_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> EnvActionType:
-        """Returns the last action for the specified AgentID, or zeros.
-
-        The "last" action is the most recent one taken by the agent.
-
-        Args:
-            agent_id: The agent's ID to get the last action for.
-
-        Returns:
-            Last action the specified AgentID has executed.
-            Zeros in case the agent has never performed any actions in the
-            episode.
-        """
-        policy_id = self.policy_for(agent_id)
-        policy = self.policy_map[policy_id]
-
-        # Agent has already taken at least one action in the episode.
-        if agent_id in self._agent_to_last_action:
-            if policy.config.get("_disable_action_flattening"):
-                return self._agent_to_last_action[agent_id]
-            else:
-                return flatten_to_single_ndarray(self._agent_to_last_action[agent_id])
-        # Agent has not acted yet, return all zeros.
-        else:
-            if policy.config.get("_disable_action_flattening"):
-                return tree.map_structure(
-                    lambda s: np.zeros_like(s.sample(), s.dtype)
-                    if hasattr(s, "dtype")
-                    else np.zeros_like(s.sample()),
-                    policy.action_space_struct,
-                )
-            else:
-                flat = flatten_to_single_ndarray(policy.action_space.sample())
-                if hasattr(policy.action_space, "dtype"):
-                    return np.zeros_like(flat, dtype=policy.action_space.dtype)
-                return np.zeros_like(flat)
-
-    @DeveloperAPI
-    def prev_action_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> EnvActionType:
-        """Returns the previous action for the specified agent, or zeros.
-
-        The "previous" action is the one taken one timestep before the
-        most recent action taken by the agent.
-
-        Args:
-            agent_id: The agent's ID to get the previous action for.
-
-        Returns:
-            Previous action the specified AgentID has executed.
-            Zero in case the agent has never performed any actions (or only
-            one) in the episode.
-        """
-        policy_id = self.policy_for(agent_id)
-        policy = self.policy_map[policy_id]
-
-        # We are at t > 1 -> There has been a previous action by this agent.
-        if agent_id in self._agent_to_prev_action:
-            if policy.config.get("_disable_action_flattening"):
-                return self._agent_to_prev_action[agent_id]
-            else:
-                return flatten_to_single_ndarray(self._agent_to_prev_action[agent_id])
-        # We're at t <= 1, so return all zeros.
-        else:
-            if policy.config.get("_disable_action_flattening"):
-                return tree.map_structure(
-                    lambda a: np.zeros_like(a, a.dtype)
-                    if hasattr(a, "dtype")  # noqa
-                    else np.zeros_like(a),  # noqa
-                    self.last_action_for(agent_id),
-                )
-            else:
-                return np.zeros_like(self.last_action_for(agent_id))
-
-    @DeveloperAPI
     def last_reward_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> float:
         """Returns the last reward for the specified agent, or zero.
 
@@ -348,23 +274,6 @@ class Episode:
             return 0.0
 
     @DeveloperAPI
-    def rnn_state_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> List[Any]:
-        """Returns the last RNN state for the specified agent.
-
-        Args:
-            agent_id: The agent's ID to get the most recent RNN state for.
-
-        Returns:
-            Most recent RNN state of the the specified AgentID.
-        """
-
-        if agent_id not in self._agent_to_rnn_state:
-            policy_id = self.policy_for(agent_id)
-            policy = self.policy_map[policy_id]
-            self._agent_to_rnn_state[agent_id] = policy.get_initial_state()
-        return self._agent_to_rnn_state[agent_id]
-
-    @DeveloperAPI
     def last_done_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> bool:
         """Returns the last done flag for the specified AgentID.
 
@@ -377,25 +286,6 @@ class Episode:
         if agent_id not in self._agent_to_last_done:
             self._agent_to_last_done[agent_id] = False
         return self._agent_to_last_done[agent_id]
-
-    @DeveloperAPI
-    def last_extra_action_outs_for(
-        self,
-        agent_id: AgentID = _DUMMY_AGENT_ID,
-    ) -> dict:
-        """Returns the last extra-action outputs for the specified agent.
-
-        This data is returned by a call to
-        `Policy.compute_actions_from_input_dict` as the 3rd return value
-        (1st return value = action; 2nd return value = RNN state outs).
-
-        Args:
-            agent_id: The agent's ID to get the last extra-action outs for.
-
-        Returns:
-            The last extra-action outs for the specified AgentID.
-        """
-        return self._agent_to_last_extra_action_outs[agent_id]
 
     @DeveloperAPI
     def get_agents(self) -> List[AgentID]:
@@ -414,9 +304,6 @@ class Episode:
                 self.total_reward += reward
                 self._agent_reward_history[agent_id].append(reward)
 
-    def _set_rnn_state(self, agent_id, rnn_state):
-        self._agent_to_rnn_state[agent_id] = rnn_state
-
     def _set_last_observation(self, agent_id, obs):
         self._agent_to_last_obs[agent_id] = obs
 
@@ -428,14 +315,6 @@ class Episode:
 
     def _set_last_info(self, agent_id, info):
         self._agent_to_last_info[agent_id] = info
-
-    def _set_last_action(self, agent_id, action):
-        if agent_id in self._agent_to_last_action:
-            self._agent_to_prev_action[agent_id] = self._agent_to_last_action[agent_id]
-        self._agent_to_last_action[agent_id] = action
-
-    def _set_last_extra_action_outs(self, agent_id, pi_info):
-        self._agent_to_last_extra_action_outs[agent_id] = pi_info
 
     def _agent_index(self, agent_id):
         if agent_id not in self._agent_to_index:
@@ -451,10 +330,6 @@ class Episode:
             error=False,
         )
         return self.policy_mapping_fn
-
-    @Deprecated(new="Episode.last_extra_action_outs_for", error=False)
-    def last_pi_info_for(self, *args, **kwargs):
-        return self.last_extra_action_outs_for(*args, **kwargs)
 
 
 # Backward compatibility. The name Episode implies that there is

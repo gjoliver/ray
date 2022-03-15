@@ -467,6 +467,9 @@ def timeslice_along_seq_lens_with_overlap(
             i = 0
             key = "state_in_{}".format(i)
             while key in data:
+                # Note(jungong): this doesn't make sense. begin - 1 is from last episode,
+                # why would we take the last state_out from last episode as state_in for
+                # this episode???
                 data[key] = sample_batch["state_out_{}".format(i)][begin - 1 : begin]
                 del data["state_out_{}".format(i)]
                 i += 1
