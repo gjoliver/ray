@@ -903,6 +903,11 @@ class RolloutWorker(ParallelIteratorWorker):
 
         if self.fake_sampler:
             self.last_batch = batch
+
+        # Make sure batch is of same size and shape.
+        assert(len(batch) == 100), len(batch)
+        assert(batch.size_bytes() == 4006500), batch.size_bytes()
+
         return batch
 
     @DeveloperAPI
