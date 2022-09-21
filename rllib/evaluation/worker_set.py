@@ -17,7 +17,7 @@ from typing import (
 
 import ray
 from ray.actor import ActorHandle
-from ray.exceptions import RayError
+from ray.exceptions import RayActorError
 from ray.rllib.evaluation.rollout_worker import RolloutWorker
 from ray.rllib.env.base_env import BaseEnv
 from ray.rllib.env.env_context import EnvContext
@@ -34,8 +34,9 @@ from ray.rllib.offline import (
 )
 from ray.rllib.policy.policy import Policy, PolicySpec, PolicyState
 from ray.rllib.utils import merge_dicts
-from ray.rllib.utils.annotations import DeveloperAPI
-from ray.rllib.utils.deprecation import Deprecated
+from ray.rllib.utils.actor_manager import FaultTolerantActorManager
+from ray.rllib.utils.annotations import DeveloperAPI, PublicAPI
+from ray.rllib.utils.deprecation import Deprecated, deprecation_warning
 from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.from_config import from_config
 from ray.rllib.utils.policy import validate_policy_id
@@ -51,6 +52,7 @@ from ray.rllib.utils.typing import (
     TensorType,
 )
 from ray.tune.registry import registry_contains_input, registry_get_input
+from traitlets import default
 
 tf1, tf, tfv = try_import_tf()
 
@@ -77,6 +79,7 @@ class WorkerSet:
         num_workers: int = 0,
         local_worker: bool = True,
         logdir: Optional[str] = None,
+        max_remote_requests_in_flight_per_actors = -1,
         _setup: bool = True,
     ):
         """Initializes a WorkerSet instance.
@@ -95,6 +98,9 @@ class WorkerSet:
                 in the returned set as well (default: True). If `num_workers`
                 is 0, always create a local worker.
             logdir: Optional logging directory for workers.
+            max_remote_requests_in_flight_per_worker: The maximum number of remote
+                requests that can be in flight per actor. Any requests made to the pool
+                that cannot be scheduled because of the limit will be dropped.
             _setup: Whether to setup workers. This is only for testing.
         """
 
@@ -111,102 +117,199 @@ class WorkerSet:
             "num_gpus": self._remote_config["num_gpus_per_worker"],
             "resources": self._remote_config["custom_resources_per_worker"],
         }
+        if trainer_config["recreate_failed_workers"]:
+            # Tell Ray Core to always restart the worker actor.
+            self._remote_args["max_restarts"] = -1
         self._cls = RolloutWorker.as_remote(**self._remote_args).remote
         self._logdir = logdir
+
         if _setup:
-            # Force a local worker if num_workers == 0 (no remote workers).
-            # Otherwise, this WorkerSet would be empty.
-            self._local_worker = None
-            if num_workers == 0:
-                local_worker = True
-            self._local_config = merge_dicts(
-                trainer_config,
-                {"tf_session_args": trainer_config["local_tf_session_args"]},
-            )
-
-            if trainer_config["input"] == "dataset":
-                # Create the set of dataset readers to be shared by all the
-                # rollout workers.
-                self._ds, self._ds_shards = get_dataset_and_shards(
-                    trainer_config, num_workers
-                )
-            else:
-                self._ds = None
-                self._ds_shards = None
-
-            # Create a number of @ray.remote workers.
-            self._remote_workers = []
-            self.add_workers(
-                num_workers,
-                validate=trainer_config.get("validate_workers_after_construction"),
-            )
-
-            # Create a local worker, if needed.
-            # If num_workers > 0 and we don't have an env on the local worker,
-            # get the observation- and action spaces for each policy from
-            # the first remote worker (which does have an env).
-            if (
-                local_worker
-                and self._remote_workers
-                and not trainer_config.get("create_env_on_driver")
-                and (
-                    not trainer_config.get("observation_space")
-                    or not trainer_config.get("action_space")
-                )
-            ):
-                remote_spaces = ray.get(
-                    self.remote_workers()[0].foreach_policy.remote(
-                        lambda p, pid: (pid, p.observation_space, p.action_space)
-                    )
-                )
-                spaces = {
-                    e[0]: (getattr(e[1], "original_space", e[1]), e[2])
-                    for e in remote_spaces
-                }
-                # Try to add the actual env's obs/action spaces.
-                try:
-                    env_spaces = ray.get(
-                        self.remote_workers()[0].foreach_env.remote(
-                            lambda env: (env.observation_space, env.action_space)
-                        )
-                    )[0]
-                    spaces["__env__"] = env_spaces
-                except Exception:
-                    pass
-
-                logger.info(
-                    "Inferred observation/action spaces from remote "
-                    f"worker (local worker has no env): {spaces}"
-                )
-            else:
-                spaces = None
-
-            if local_worker:
-                self._local_worker = self._make_worker(
-                    cls=RolloutWorker,
-                    env_creator=env_creator,
+            try:
+                self._setup(
                     validate_env=validate_env,
-                    policy_cls=self._policy_class,
-                    # Initially, policy_specs will be inferred from config dict.
-                    policy_specs=None,
-                    worker_index=0,
+                    trainer_config=trainer_config,
                     num_workers=num_workers,
-                    config=self._local_config,
-                    spaces=spaces,
+                    local_worker=local_worker,
                 )
+            # WorkerSet creation possibly fails, if some (remote) workers cannot
+            # be initialized properly (due to some errors in the RolloutWorker's
+            # constructor).
+            except RayActorError as e:
+                # In case of an actor (remote worker) init failure, the remote worker
+                # may still exist and will be accessible, however, e.g. calling
+                # its `sample.remote()` would result in strange "property not found"
+                # errors.
+                if e.actor_init_failed:
+                    # Raise the original error here that the RolloutWorker raised
+                    # during its construction process. This is to enforce transparency
+                    # for the user (better to understand the real reason behind the
+                    # failure).
+                    # - e.args[0]: The RayTaskError (inside the caught RayActorError).
+                    # - e.args[0].args[2]: The original Exception (e.g. a ValueError due
+                    # to a config mismatch) thrown inside the actor.
+                    raise e.args[0].args[2]
+                # In any other case, raise the RayActorError as-is.
+                else:
+                    raise e
+
+    def _setup(
+        self,
+        *,
+        validate_env: Optional[Callable[[EnvType], None]] = None,
+        trainer_config: Optional[AlgorithmConfigDict] = None,
+        num_workers: int = 0,
+        local_worker: bool = True,
+    ):
+        """Initializes a WorkerSet instance.
+
+        Args:
+            validate_env: Optional callable to validate the generated
+                environment (only on worker=0).
+            trainer_config: Optional dict that extends the common config of
+                the Algorithm class.
+            num_workers: Number of remote rollout workers to create.
+            local_worker: Whether to create a local (non @ray.remote) worker
+                in the returned set as well (default: True). If `num_workers`
+                is 0, always create a local worker.
+        """
+        # Force a local worker if num_workers == 0 (no remote workers).
+        # Otherwise, this WorkerSet would be empty.
+        self._local_worker = None
+        if num_workers == 0:
+            local_worker = True
+        self._local_config = merge_dicts(
+            trainer_config,
+            {"tf_session_args": trainer_config["local_tf_session_args"]},
+        )
+
+        if trainer_config["input"] == "dataset":
+            # Create the set of dataset readers to be shared by all the
+            # rollout workers.
+            self._ds, self._ds_shards = get_dataset_and_shards(
+                trainer_config, num_workers
+            )
+        else:
+            self._ds = None
+            self._ds_shards = None
+
+        self.__worker_manager = FaultTolerantActorManager(
+            ignore_worker_failure=trainer_config["ignore_worker_failures"]
+        )
+        # Create a number of @ray.remote workers.
+        self.add_workers(
+            num_workers,
+            validate=trainer_config.get("validate_workers_after_construction"),
+        )
+
+        # Create a local worker, if needed.
+        # If num_workers > 0 and we don't have an env on the local worker,
+        # get the observation- and action spaces for each policy from
+        # the first remote worker (which does have an env).
+        if (
+            local_worker
+            and self.__worker_manager.num_actors() > 0
+            and not trainer_config.get("create_env_on_driver")
+            and (
+                not trainer_config.get("observation_space")
+                or not trainer_config.get("action_space")
+            )
+        ):
+            # Try to figure out spaces from the first remote worker.
+            remote_spaces = self.foreach_worker(
+                lambda worker: worker.foreach_policy(
+                    lambda p, pid: (pid, p.observation_space, p.action_space)
+                ),
+                remote_worker_indices=[0],
+            )[0]
+            spaces = {
+                e[0]: (getattr(e[1], "original_space", e[1]), e[2])
+                for e in remote_spaces
+            }
+            # Try to add the actual env's obs/action spaces.
+            try:
+                env_spaces = self.foreach_worker(
+                    lambda worker: worker.foreach_env.remote(
+                        lambda env: (env.observation_space, env.action_space)
+                    ),
+                    remote_worker_indices=[0],
+                )[0][0]
+                spaces["__env__"] = env_spaces
+            except Exception:
+                pass
+
+            logger.info(
+                "Inferred observation/action spaces from remote "
+                f"worker (local worker has no env): {spaces}"
+            )
+        else:
+            spaces = None
+
+        if local_worker:
+            self._local_worker = self._make_worker(
+                cls=RolloutWorker,
+                env_creator=self._env_creator,
+                validate_env=validate_env,
+                policy_cls=self._policy_class,
+                # Initially, policy_specs will be inferred from config dict.
+                policy_specs=None,
+                worker_index=0,
+                num_workers=num_workers,
+                config=self._local_config,
+                spaces=spaces,
+            )
 
     def local_worker(self) -> RolloutWorker:
         """Returns the local rollout worker."""
         return self._local_worker
 
-    def remote_workers(self) -> List[ActorHandle]:
-        """Returns a list of remote rollout workers."""
-        return self._remote_workers
+    @property
+    def _remote_workers(self) -> List[ActorHandle]:
+        """Returns the list of remote rollout workers.
+        """
+        deprecation_warning(
+            old="_remote_workers",
+            help=(
+                "Accessing the list of remote workers directly through "
+                "_remote_workers is strongly discouraged. "
+                "Please try to use one of the foreach accessors that is "
+                "remote actor state aware. "
+            ),
+            error=False,
+        )
+        return self.__worker_manager.__actors
 
+    def remote_workers(self) -> List[ActorHandle]:
+        """Returns the list of remote rollout workers.
+        """
+        deprecation_warning(
+            old="remote_workers()",
+            help=(
+                "Accessing the list of remote workers directly through "
+                "remote_workers() is strongly discouraged. "
+                "Please try to use one of the foreach accessors that is "
+                "remote actor state aware. "
+            ),
+            error=True,
+        )
+        return self.__worker_manager.__actors
+
+    @PublicAPI
+    def num_remote_workers(self) -> int:
+        return self.__worker_manager.num_actors()
+
+    @PublicAPI
+    def num_healthy_workers(self) -> int:
+        if self._local_worker and self.__worker_manager.num_healthy_actors() <= 0:
+            return 1
+        # Return the number of healthy remote workers after this iteration.
+        return self.__worker_manager.num_healthy_actors()
+
+    @DeveloperAPI
     def sync_weights(
         self,
         policies: Optional[List[PolicyID]] = None,
         from_worker: Optional[RolloutWorker] = None,
+        to_worker_indices: Optional[List[int]] = None,
         global_vars: Optional[Dict[str, TensorType]] = None,
     ) -> None:
         """Syncs model weights from the local worker to all remote workers.
@@ -225,25 +328,39 @@ class WorkerSet:
                 "arg in `sync_weights()`!"
             )
 
-        # Only sync if we have remote workers or `from_worker` is provided.
-        weights = None
-        if self.remote_workers() or from_worker is not None:
-            weights = (from_worker or self.local_worker()).get_weights(policies)
-            # Put weights only once into object store and use same object
-            # ref to synch to all workers.
-            weights_ref = ray.put(weights)
-            # Sync to all remote workers in this WorkerSet.
-            for to_worker in self.remote_workers():
-                to_worker.set_weights.remote(weights_ref, global_vars=global_vars)
+        weights = (from_worker or self.local_worker()).get_weights(policies)
+        # Put weights only once into object store and use same object
+        # ref to synch to all workers.
+        weights_ref = ray.put(weights)
+
+        def set_weight(w):
+            w.set_weights(ray.get(weights_ref), global_vars)
+
+        # Sync to all remote workers in this WorkerSet.
+        # We take weight syncing as a good opportunity for health check.
+        # The reason this is a good place to do health check is that we need
+        # to bring any restarted remote workers up to date anyways.
+        # Any remote workers that have latest weights synced are active, and will
+        # be able to participate in the next rounds of rollout or evaluation.
+        # If weight sync fails, the remote worker is taken out of service until:
+        # 1. Ray Core restarts the actor, and
+        # 2. The worker gets bought up-to-date during next weight syncing.
+        # Since this is a health check, we want to do it on all remote workers.
+        self.foreach_worker(
+            func=set_weight,
+            healthy_only=False,
+            remote_worker_indices=to_worker_indices,
+        )
 
         # If `from_worker` is provided, also sync to this WorkerSet's
         # local worker.
-        if from_worker is not None and self.local_worker() is not None:
-            self.local_worker().set_weights(weights, global_vars=global_vars)
-        # If `global_vars` is provided and local worker exists  -> Update its
-        # global_vars.
-        elif self.local_worker() is not None and global_vars is not None:
-            self.local_worker().set_global_vars(global_vars)
+        if self.local_worker():
+            if from_worker is not None:
+                self.local_worker().set_weights(weights, global_vars=global_vars)
+            # If `global_vars` is provided and local worker exists  -> Update its
+            # global_vars.
+            elif global_vars is not None:
+                self.local_worker().set_global_vars(global_vars)
 
     def add_policy(
         self,
@@ -463,29 +580,26 @@ class WorkerSet:
             RayError: If any of the constructed remote workers is not up and running
             properly.
         """
-        old_num_workers = len(self._remote_workers)
-        self._remote_workers.extend(
-            [
-                self._make_worker(
-                    cls=self._cls,
-                    env_creator=self._env_creator,
-                    validate_env=None,
-                    policy_cls=self._policy_class,
-                    # Setup remote workers with policy_specs inferred from config dict.
-                    # Simply provide None here.
-                    policy_specs=None,
-                    worker_index=old_num_workers + i + 1,
-                    num_workers=old_num_workers + num_workers,
-                    config=self._remote_config,
-                )
-                for i in range(num_workers)
-            ]
-        )
+        old_num_workers = self.__worker_manager.num_actors()
+        new_workers = [
+            self._make_worker(
+                cls=self._cls,
+                env_creator=self._env_creator,
+                validate_env=None,
+                policy_cls=self._policy_class,
+                # Setup remote workers with policy_specs inferred from config dict.
+                # Simply provide None here.
+                policy_specs=None,
+                worker_index=old_num_workers + i + 1,
+                num_workers=old_num_workers + num_workers,
+                config=self._remote_config,
+            )
+            for i in range(num_workers)
+        ]
+        self.__worker_manager.add_actors(new_workers)
 
         # Validate here, whether all remote workers have been constructed properly
-        # and are "up and running". If not, the following will throw a RayError
-        # which needs to be handled by this WorkerSet's owner (usually
-        # a RLlib Algorithm instance).
+        # and are "up and running". Establish initial states.
         if validate:
             self.foreach_worker(lambda w: w.assert_healthy())
 
@@ -496,102 +610,21 @@ class WorkerSet:
             new_remote_workers: A list of new RolloutWorkers
                 (as `ActorHandles`) to use as remote workers.
         """
-        self._remote_workers = new_remote_workers
-
-    def remove_failed_workers(self):
-        faulty_indices = self._worker_health_check()
-        removed_workers = []
-        # Terminate faulty workers.
-        for worker_index in faulty_indices:
-            worker = self.remote_workers()[worker_index - 1]
-            logger.info(f"Trying to terminate faulty worker {worker_index}.")
-            try:
-                worker.__ray_terminate__.remote()
-                removed_workers.append(worker)
-            except Exception:
-                logger.exception("Error terminating faulty worker.")
-
-        # Remove all faulty workers from self._remote_workers.
-        for worker_index in reversed(faulty_indices):
-            del self._remote_workers[worker_index - 1]
-        # TODO: Should we also change each healthy worker's num_workers counter and
-        #  worker_index property?
-
-        if len(self.remote_workers()) == 0:
-            raise RuntimeError(
-                f"No healthy workers remaining (worker indices {faulty_indices} have "
-                f"died)! Can't continue training."
-            )
-        return removed_workers
-
-    def recreate_failed_workers(
-        self, local_worker_for_synching: RolloutWorker
-    ) -> Tuple[List[ActorHandle], List[ActorHandle]]:
-        """Recreates any failed workers (after health check).
-
-        Args:
-            local_worker_for_synching: RolloutWorker to use to synchronize the weights
-                after recreation.
-
-        Returns:
-            A tuple consisting of two items: The list of removed workers and the list of
-            newly added ones.
-        """
-        faulty_indices = self._worker_health_check()
-        removed_workers = []
-        new_workers = []
-        for worker_index in faulty_indices:
-            worker = self.remote_workers()[worker_index - 1]
-            removed_workers.append(worker)
-            logger.info(f"Trying to recreate faulty worker {worker_index}")
-            try:
-                worker.__ray_terminate__.remote()
-            except Exception:
-                logger.exception("Error terminating faulty worker.")
-            # Try to recreate the failed worker (start a new one).
-            new_worker = self._make_worker(
-                cls=self._cls,
-                env_creator=self._env_creator,
-                validate_env=None,
-                policy_cls=self._policy_class,
-                # For recreated remote workers, we need to sync the entire
-                # policy specs dict from local_worker_for_synching.
-                # We can not let self._make_worker() infer policy specs
-                # from self._remote_config dict because custom policies
-                # may be added to both rollout and evaluation workers
-                # while the training job progresses.
-                policy_specs=local_worker_for_synching.policy_dict,
-                worker_index=worker_index,
-                num_workers=len(self._remote_workers),
-                recreated_worker=True,
-                config=self._remote_config,
-            )
-
-            # Sync new worker from provided one (or local one).
-            # Restore weights and global variables.
-            new_worker.set_weights.remote(
-                weights=local_worker_for_synching.get_weights(),
-                global_vars=local_worker_for_synching.get_global_vars(),
-            )
-
-            # Add new worker to list of remote workers.
-            self._remote_workers[worker_index - 1] = new_worker
-            new_workers.append(new_worker)
-
-        return removed_workers, new_workers
+        self.__worker_manager.clear()
+        self.__worker_manager.add_actors(new_remote_workers)
 
     def stop(self) -> None:
         """Calls `stop` on all rollout workers (including the local one)."""
         try:
             if self.local_worker():
                 self.local_worker().stop()
-            tids = [w.stop.remote() for w in self.remote_workers()]
-            ray.get(tids)
+            # Make sure we stop all workers, include the ones that were just
+            # restarted / recovered.
+            self.foreach_worker(lambda w: w.stop(), healthy_only=False)
         except Exception:
             logger.exception("Failed to stop workers!")
         finally:
-            for w in self.remote_workers():
-                w.__ray_terminate__.remote()
+            self.__worker_manager.clear()
 
     @DeveloperAPI
     def is_policy_to_train(
@@ -605,48 +638,88 @@ class WorkerSet:
             raise NotImplementedError
 
     @DeveloperAPI
-    def foreach_worker(self, func: Callable[[RolloutWorker], T]) -> List[T]:
+    def foreach_worker(
+        self,
+        func: Callable[[RolloutWorker], T],
+        *,
+        local_worker = False,
+        healthy_only = True,
+        remote_worker_indices: List[int] = None,
+        timeout_seconds = None,
+    ) -> List[T]:
         """Calls the given function with each worker instance as arg.
 
         Args:
             func: The function to call for each worker (as only arg).
+            local_worker: Whether apply func on local worker too. Default is True.
+            healthy_only: Apply func on known active workers only.
+            remote_worker_indices: Apply func on a selected set of remote workers.
+            timeout_seconds: Ray.get() timeout. Default is None.
+                Note(jungong) : setting timeout_seconds to 0 effectively makes all the
+                remote calls fire-and-forget, while setting timeout_seconds to None
+                make them synchronous calls.
 
         Returns:
              The list of return values of all calls to `func([worker])`.
         """
         local_result = []
-        if self.local_worker() is not None:
+        if local_worker and self.local_worker() is not None:
             local_result = [func(self.local_worker())]
-        remote_results = ray.get([w.apply.remote(func) for w in self.remote_workers()])
+
+        remote_results = self.__worker_manager.foreach_actor(
+            func,
+            healthy_only=healthy_only,
+            remote_actor_indices=remote_worker_indices,
+            timeout_seconds=timeout_seconds
+        )
+
         return local_result + remote_results
 
     @DeveloperAPI
-    def foreach_worker_with_index(
-        self, func: Callable[[RolloutWorker, int], T]
-    ) -> List[T]:
-        """Calls `func` with each worker instance and worker idx as args.
-
-        The index will be passed as the second arg to the given function.
+    def foreach_worker_async(
+        self,
+        func: Callable[[RolloutWorker], T],
+        *,
+        healthy_only = True,
+        remote_worker_indices: List[int] = None,
+    ) -> int:
+        """Calls the given function with each worker instance as arg.
 
         Args:
-            func: The function to call for each worker and its index
-                (as args). The local worker has index 0, all remote workers
-                have indices > 0.
+            func: The function to call for each worker (as only arg).
+            healthy_only: Apply func on known active workers only.
+            remote_worker_indices: Apply func on a selected set of remote workers.
 
         Returns:
-             The list of return values of all calls to `func([worker, idx])`.
-                The first entry in this list are the results of the local
-                worker, followed by all remote workers' results.
+            The number of async requests that are actually fired.
         """
-        local_result = []
-        # Local worker: Index=0.
-        if self.local_worker() is not None:
-            local_result = [func(self.local_worker(), 0)]
-        # Remote workers: Index > 0.
-        remote_results = ray.get(
-            [w.apply.remote(func, i + 1) for i, w in enumerate(self.remote_workers())]
+        return self.__worker_manager.foreach_actor_async(
+            func,
+            healthy_only=healthy_only,
+            remote_actor_indices=remote_worker_indices,
         )
-        return local_result + remote_results
+
+    @DeveloperAPI
+    def fetch_ready_async_reqs(
+        self,
+        *,
+        timeout_seconds=0,
+    ) -> Tuple[List[int], List[T]]:
+        """Get results from outstanding async requests that are ready.
+
+        Args:
+            timeout_seconds: Ray.get() timeout. Default is 0 (only those that are
+                already ready).
+            fetch_local: whether to fetch remote call results to local object
+                store with ray.wait(). Default is True.
+
+        Returns:
+            A list of results successfully returned from outstanding remote calls,
+            paired with the indices of the callee workers.
+        """
+        return self.__worker_manager.fetch_ready_async_reqs(
+            timeout_seconds=timeout_seconds
+        )
 
     @DeveloperAPI
     def foreach_policy(self, func: Callable[[Policy, PolicyID], T]) -> List[T]:
@@ -670,10 +743,9 @@ class WorkerSet:
         results = []
         if self.local_worker() is not None:
             results = self.local_worker().foreach_policy(func)
-        ray_gets = []
-        for worker in self.remote_workers():
-            ray_gets.append(worker.apply.remote(lambda w: w.foreach_policy(func)))
-        remote_results = ray.get(ray_gets)
+        remote_results = self.foreach_worker(
+            lambda w: w.foreach_policy(func), healthy_only=True,
+        )
         for r in remote_results:
             results.extend(r)
         return results
@@ -694,12 +766,9 @@ class WorkerSet:
         results = []
         if self.local_worker() is not None:
             results = self.local_worker().foreach_policy_to_train(func)
-        ray_gets = []
-        for worker in self.remote_workers():
-            ray_gets.append(
-                worker.apply.remote(lambda w: w.foreach_policy_to_train(func))
-            )
-        remote_results = ray.get(ray_gets)
+        remote_results = self.foreach_worker(
+            lambda w: w.foreach_policy_to_train(func), healthy_only=True,
+        )
         for r in remote_results:
             results.extend(r)
         return results
@@ -724,10 +793,10 @@ class WorkerSet:
         local_results = []
         if self.local_worker() is not None:
             local_results = [self.local_worker().foreach_env(func)]
-        ray_gets = []
-        for worker in self.remote_workers():
-            ray_gets.append(worker.foreach_env.remote(func))
-        return local_results + ray.get(ray_gets)
+        remote_results = self.foreach_worker(
+            lambda w: w.foreach_env(func), healthy_only=True
+        )
+        return local_results + remote_results
 
     @DeveloperAPI
     def foreach_env_with_context(
@@ -752,10 +821,10 @@ class WorkerSet:
         local_results = []
         if self.local_worker() is not None:
             local_results = [self.local_worker().foreach_env_with_context(func)]
-        ray_gets = []
-        for worker in self.remote_workers():
-            ray_gets.append(worker.foreach_env_with_context.remote(func))
-        return local_results + ray.get(ray_gets)
+        remote_results = self.foreach_worker(
+            lambda w: w.foreach_env_with_context(func), healthy_only=True
+        )
+        return local_results + remote_results
 
     @staticmethod
     def _from_existing(
@@ -765,7 +834,7 @@ class WorkerSet:
             env_creator=None, policy_class=None, trainer_config={}, _setup=False
         )
         workers._local_worker = local_worker
-        workers._remote_workers = remote_workers or []
+        workers.__worker_manager.add_actors(remote_workers or [])
         return workers
 
     def _make_worker(
@@ -932,33 +1001,6 @@ class WorkerSet:
         )
 
         return worker
-
-    def _worker_health_check(self) -> List[int]:
-        """Performs a health-check on each remote worker.
-
-        Returns:
-            List of indices (into `self._remote_workers` list) of faulty workers.
-            Note that index=1 is the 0th item in `self._remote_workers`.
-        """
-        logger.info("Health checking all workers ...")
-        checks = []
-        for worker in self.remote_workers():
-            # TODO: Maybe find a better way to probe for healthiness. Performing an
-            #  entire `sample()` step may be costly. Then again, we only do this
-            #  upon any worker failure during the `step_attempt()`, not regularly.
-            _, obj_ref = worker.sample_with_count.remote()
-            checks.append(obj_ref)
-
-        faulty_worker_indices = []
-        for i, obj_ref in enumerate(checks):
-            try:
-                ray.get(obj_ref)
-                logger.info("Worker {} looks healthy.".format(i + 1))
-            except RayError:
-                logger.exception("Worker {} is faulty.".format(i + 1))
-                faulty_worker_indices.append(i + 1)
-
-        return faulty_worker_indices
 
     @classmethod
     def _valid_module(cls, class_path):

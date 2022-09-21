@@ -19,7 +19,7 @@ class AsyncRequestsManager:
             requests that can be in flight per actor. Any requests made to the pool
             that cannot be scheduled because the
             max_remote_requests_in_flight_per_worker per actor has been reached will
-            be queued.
+            be dropped.
         ray_wait_timeout_s: The maximum amount of time to wait for inflight requests
             to be done and ready when calling
             AsyncRequestsManager.get_ready_results().

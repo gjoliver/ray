@@ -187,6 +187,7 @@ class RolloutWorker(ParallelIteratorWorker):
         num_gpus: Optional[Union[int, float]] = None,
         memory: Optional[int] = None,
         resources: Optional[dict] = None,
+        max_restarts: Optional[int] = 0,
     ) -> type:
         """Returns RolloutWorker class as a `@ray.remote using given options`.
 
@@ -208,6 +209,7 @@ class RolloutWorker(ParallelIteratorWorker):
             num_gpus=num_gpus,
             memory=memory,
             resources=resources,
+            max_restarts=max_restarts,
         )(cls)
 
     @DeveloperAPI
@@ -1734,7 +1736,15 @@ class RolloutWorker(ParallelIteratorWorker):
         Returns:
             The return value of the function call.
         """
-        return func(self, *args, **kwargs)
+        try:
+            ret = func(self, *args, **kwargs)
+        except Exception as e:
+            if self.policy_config["recreate_failed_workers"]:
+                # Stop this worker actor, so Ray core will recreate it.
+                logger.fatal(str(e))
+            else:
+                raise e
+        return ret
 
     def setup_torch_data_parallel(
         self, url: str, world_rank: int, world_size: int, backend: str

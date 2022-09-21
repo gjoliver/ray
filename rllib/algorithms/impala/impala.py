@@ -225,8 +225,8 @@ class ImpalaConfig(AlgorithmConfig):
             timeout_s_aggregator_manager: The timeout for waiting for replay worker
                 results -- typically if this is too low, the manager won't be able to
                 retrieve ready replay requests.
-            broadcast_interval: Max number of workers to broadcast one set of
-                weights to.
+            broadcast_interval: Number of training step calls before weights are
+                broadcasted to all the rollout and evaluation workers again.
             num_aggregation_workers: Use n (`num_aggregation_workers`) extra Actors for
                 multi-level aggregation of the data produced by the m RolloutWorkers
                 (`num_workers`). Note that n should be much smaller than m.
@@ -861,21 +861,6 @@ class Impala(Algorithm):
         self.workers.local_worker().set_global_vars(global_vars)
 
     @override(Algorithm)
-    def on_worker_failures(
-        self, removed_workers: List[ActorHandle], new_workers: List[ActorHandle]
-    ):
-        """Handle the failures of remote sampling workers
-
-        Args:
-            removed_workers: removed worker ids.
-            new_workers: ids of newly created workers.
-        """
-        self._sampling_actor_manager.remove_workers(
-            removed_workers, remove_in_flight_requests=True
-        )
-        self._sampling_actor_manager.add_workers(new_workers)
-
-    @override(Algorithm)
     def _compile_iteration_results(self, *args, **kwargs):
         result = super()._compile_iteration_results(*args, **kwargs)
         result = self._learner_thread.add_learner_metrics(
@@ -913,7 +898,15 @@ class AggregatorWorker:
         **kwargs,
     ) -> T:
         """Calls the given function with this AggregatorWorker instance."""
-        return func(self, *_args, **kwargs)
+        try:
+            ret = func(self, *_args, **kwargs)
+        except Exception as e:
+            if self.config["recreate_failed_workers"]:
+                # Stop this worker actor, so Ray core will recreate it.
+                logger.fatal(str(e))
+            else:
+                raise e
+        return ret
 
     def get_host(self) -> str:
         return platform.node()

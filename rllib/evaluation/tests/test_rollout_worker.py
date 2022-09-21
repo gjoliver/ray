@@ -198,31 +198,6 @@ class TestRolloutWorker(unittest.TestCase):
                 ),
             )
 
-    def test_query_evaluators(self):
-        register_env("test", lambda _: gym.make("CartPole-v0"))
-        for fw in framework_iterator(frameworks=("torch", "tf")):
-            pg = PG(
-                env="test",
-                config={
-                    "num_workers": 2,
-                    "rollout_fragment_length": 5,
-                    "num_envs_per_worker": 2,
-                    "framework": fw,
-                    "create_env_on_driver": True,
-                },
-            )
-            results = pg.workers.foreach_worker(lambda ev: ev.rollout_fragment_length)
-            results2 = pg.workers.foreach_worker_with_index(
-                lambda ev, i: (i, ev.rollout_fragment_length)
-            )
-            results3 = pg.workers.foreach_worker(
-                lambda ev: ev.foreach_env(lambda env: 1)
-            )
-            self.assertEqual(results, [10, 10, 10])
-            self.assertEqual(results2, [(0, 10), (1, 10), (2, 10)])
-            self.assertEqual(results3, [[1, 1], [1, 1], [1, 1]])
-            pg.stop()
-
     def test_action_clipping(self):
         from ray.rllib.examples.env.random_env import RandomEnv
 

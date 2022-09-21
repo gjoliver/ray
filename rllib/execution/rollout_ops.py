@@ -1,4 +1,5 @@
 import logging
+from random import sample
 import time
 from typing import Container, List, Optional, Tuple, TYPE_CHECKING, Union
 
@@ -87,19 +88,27 @@ def synchronous_parallel_sample(
     all_sample_batches = []
 
     # Stop collecting batches as soon as one criterium is met.
-    while (max_agent_or_env_steps is None and agent_or_env_steps == 0) or (
+    while (
+        max_agent_or_env_steps is None and
+        agent_or_env_steps == 0
+    ) or (
         max_agent_or_env_steps is not None
         and agent_or_env_steps < max_agent_or_env_steps
     ):
         # No remote workers in the set -> Use local worker for collecting
         # samples.
-        if not worker_set.remote_workers():
+        if worker_set.num_remote_workers() <= 0:
             sample_batches = [worker_set.local_worker().sample()]
         # Loop over remote workers' `sample()` method in parallel.
         else:
-            sample_batches = ray.get(
-                [worker.sample.remote() for worker in worker_set.remote_workers()]
+            sample_batches = worker_set.foreach_worker(
+                lambda w: w.sample(), local_worker=False, healthy_only=True
             )
+            if worker_set.num_healthy_workers() <= 0:
+                # There is no point staying in this loop, since we will not be able to
+                # get any new samples if we don't have any remote workers left.
+                break
+
         # Update our counters for the stopping criterion of the while loop.
         for b in sample_batches:
             if max_agent_steps:
@@ -171,7 +180,7 @@ def ParallelRollouts(
             metrics.counters[AGENT_STEPS_SAMPLED_COUNTER] += batch.count
         return batch
 
-    if not workers.remote_workers():
+    if workers.num_remote_workers() <= 0:
         # Handle the `num_workers=0` case, in which the local worker
         # has to do sampling as well.
         return LocalIterator(

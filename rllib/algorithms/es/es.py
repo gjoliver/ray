@@ -516,7 +516,7 @@ class ES(Algorithm):
         return self.compute_single_action(observation, *args, **kwargs)
 
     @override(Algorithm)
-    def _sync_weights_to_workers(self, *, worker_set=None, workers=None):
+    def _sync_weights_to_workers(self, *, worker_set=None):
         # Broadcast the new policy weights to all evaluation workers.
         assert worker_set is not None
         logger.info("Synchronizing weights to evaluation workers.")

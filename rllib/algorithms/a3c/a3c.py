@@ -1,3 +1,4 @@
+from collections import defaultdict
 import logging
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -24,6 +25,7 @@ from ray.rllib.utils.typing import (
     PartialAlgorithmConfigDict,
     ResultDict,
 )
+from ray.tune.registry import get_trainable_cls
 
 logger = logging.getLogger(__name__)
 
@@ -157,13 +159,6 @@ class A3C(Algorithm):
         return A3CConfig().to_dict()
 
     @override(Algorithm)
-    def setup(self, config: PartialAlgorithmConfigDict):
-        super().setup(config)
-        self._worker_manager = AsyncRequestsManager(
-            self.workers.remote_workers(), max_remote_requests_in_flight_per_worker=1
-        )
-
-    @override(Algorithm)
     def validate_config(self, config: AlgorithmConfigDict) -> None:
         # Call super's validation method.
         super().validate_config(config)
@@ -210,8 +205,8 @@ class A3C(Algorithm):
         with self._timers[GRAD_WAIT_TIMER]:
             # Results are a mapping from ActorHandle (RolloutWorker) to their
             # returned gradient calculation results.
-            self._worker_manager.call_on_all_available(sample_and_compute_grads)
-            async_results = self._worker_manager.get_ready()
+            self.workers.foreach_worker_async(sample_and_compute_grads)
+            worker_indices, remote_results = self.workers.fetch_ready_async_reqs()
 
         # Loop through all fetched worker-computed gradients (if any)
         # and apply them - one by one - to the local worker's model.
@@ -219,24 +214,24 @@ class A3C(Algorithm):
         # update that particular worker's weights.
         global_vars = None
         learner_info_builder = LearnerInfoBuilder(num_devices=1)
-        for worker, results in async_results.items():
-            for result in results:
-                # Apply gradients to local worker.
-                with self._timers[APPLY_GRADS_TIMER]:
-                    local_worker.apply_gradients(result["grads"])
-                self._timers[APPLY_GRADS_TIMER].push_units_processed(
-                    result["agent_steps"]
-                )
+        weights_synced = defaultdict(lambda: False)
+        for worker_idx, result in zip(worker_indices, remote_results):
+            # Apply gradients to local worker.
+            with self._timers[APPLY_GRADS_TIMER]:
+                local_worker.apply_gradients(result["grads"])
+            self._timers[APPLY_GRADS_TIMER].push_units_processed(
+                result["agent_steps"]
+            )
 
-                # Update all step counters.
-                self._counters[NUM_AGENT_STEPS_SAMPLED] += result["agent_steps"]
-                self._counters[NUM_ENV_STEPS_SAMPLED] += result["env_steps"]
-                self._counters[NUM_AGENT_STEPS_TRAINED] += result["agent_steps"]
-                self._counters[NUM_ENV_STEPS_TRAINED] += result["env_steps"]
+            # Update all step counters.
+            self._counters[NUM_AGENT_STEPS_SAMPLED] += result["agent_steps"]
+            self._counters[NUM_ENV_STEPS_SAMPLED] += result["env_steps"]
+            self._counters[NUM_AGENT_STEPS_TRAINED] += result["agent_steps"]
+            self._counters[NUM_ENV_STEPS_TRAINED] += result["env_steps"]
 
-                learner_info_builder.add_learn_on_batch_results_multi_agent(
-                    result["infos"]
-                )
+            learner_info_builder.add_learn_on_batch_results_multi_agent(
+                result["infos"]
+            )
 
             # Create current global vars.
             global_vars = {
@@ -244,30 +239,19 @@ class A3C(Algorithm):
             }
 
             # Synch updated weights back to the particular worker.
-            with self._timers[SYNCH_WORKER_WEIGHTS_TIMER]:
-                weights = local_worker.get_weights(local_worker.get_policies_to_train())
-                worker.set_weights.remote(weights, global_vars)
+            if not weights_synced[worker_idx]:
+                with self._timers[SYNCH_WORKER_WEIGHTS_TIMER]:
+                    self.workers.sync_weights(
+                        policies=local_worker.get_policies_to_train(),
+                        to_worker_indices=[worker_idx]
+                    )
+                    weights_synced[worker_idx] = True
 
         # Update global vars of the local worker.
         if global_vars:
             local_worker.set_global_vars(global_vars)
 
         return learner_info_builder.finalize()
-
-    @override(Algorithm)
-    def on_worker_failures(
-        self, removed_workers: List[ActorHandle], new_workers: List[ActorHandle]
-    ):
-        """Handle failures on remote A3C workers.
-
-        Args:
-            removed_workers: removed worker ids.
-            new_workers: ids of newly created workers.
-        """
-        self._worker_manager.remove_workers(
-            removed_workers, remove_in_flight_requests=True
-        )
-        self._worker_manager.add_workers(new_workers)
 
 
 # Deprecated: Use ray.rllib.algorithms.a3c.A3CConfig instead!

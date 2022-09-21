@@ -353,10 +353,11 @@ class ApexDQN(DQN):
 
         # Tag those workers (top 1/3rd indices) that we should collect episodes from
         # for metrics due to `PerWorkerEpsilonGreedy` exploration strategy.
-        if self.workers.remote_workers():
-            self._remote_workers_for_metrics = self.workers.remote_workers()[
-                -len(self.workers.remote_workers()) // 3 :
-            ]
+        num_remote_workers = self.workers.num_remote_workers()
+        if num_remote_workers > 0:
+            self._remote_worker_indices_for_metrics = list(
+                range(num_remote_workers)
+            )[-num_remote_workers // 3:]
 
         num_replay_buffer_shards = self.config["optimizer"]["num_replay_buffer_shards"]
 
@@ -651,21 +652,6 @@ class ApexDQN(DQN):
                 if self._by_agent_steps
                 else NUM_ENV_STEPS_TRAINED
             ]
-
-    @override(Algorithm)
-    def on_worker_failures(
-        self, removed_workers: List[ActorHandle], new_workers: List[ActorHandle]
-    ):
-        """Handle the failures of remote sampling workers
-
-        Args:
-            removed_workers: removed worker ids.
-            new_workers: ids of newly created workers.
-        """
-        self._sampling_actor_manager.remove_workers(
-            removed_workers, remove_in_flight_requests=True
-        )
-        self._sampling_actor_manager.add_workers(new_workers)
 
     @override(Algorithm)
     def _compile_iteration_results(self, *args, **kwargs):

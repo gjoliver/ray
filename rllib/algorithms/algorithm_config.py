@@ -115,8 +115,6 @@ class AlgorithmConfig:
         self.remote_worker_envs = False
         self.remote_env_batch_wait_ms = 0
         self.validate_workers_after_construction = True
-        self.ignore_worker_failures = False
-        self.recreate_failed_workers = False
         self.restart_failed_sub_environments = False
         self.num_consecutive_worker_failures_tolerance = 100
         self.horizon = None
@@ -128,6 +126,8 @@ class AlgorithmConfig:
         self.compress_observations = False
         self.enable_tf1_exec_eagerly = False
         self.sampler_perf_stats_ema_coef = None
+        self.ignore_worker_failures = True
+        self.recreate_failed_workers = True
 
         # `self.training()`
         self.gamma = 0.99

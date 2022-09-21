@@ -191,21 +191,6 @@ class ApexDDPG(DDPG, ApexDQN):
         """Use APEX-DQN's training iteration function."""
         return ApexDQN.training_step(self)
 
-    @override(Algorithm)
-    def on_worker_failures(
-        self, removed_workers: List[ActorHandle], new_workers: List[ActorHandle]
-    ):
-        """Handle the failures of remote sampling workers
-
-        Args:
-            removed_workers: removed worker ids.
-            new_workers: ids of newly created workers.
-        """
-        self._sampling_actor_manager.remove_workers(
-            removed_workers, remove_in_flight_requests=True
-        )
-        self._sampling_actor_manager.add_workers(new_workers)
-
     @staticmethod
     @override(DDPG)
     def execution_plan(

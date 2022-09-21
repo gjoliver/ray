@@ -18,7 +18,7 @@ class FilterManager:
     @DeveloperAPI
     def synchronize(
         local_filters,
-        remotes,
+        worker_set,
         update_remote=True,
         timeout_seconds: Optional[float] = None,
     ):
@@ -28,39 +28,27 @@ class FilterManager:
 
         Args:
             local_filters: Filters to be synchronized.
-            remotes: Remote evaluators with filters.
+            worker_set: Remote WorkerSet with filters.
             update_remote: Whether to push updates to remote filters.
             timeout_seconds: How long to wait for filter to get or set filters
         """
-        try:
-            remote_filters = ray.get(
-                [r.get_filters.remote(flush_after=True) for r in remotes],
-                timeout=timeout_seconds,
-            )
-        except GetTimeoutError:
-            logger.error(
-                "Failed to get remote filters from a rollout worker in "
-                "FilterManager. "
-                "Filtered "
-                "metrics may be computed, but filtered wrong."
-            )
+        logger.info("Synchronizing filters ...")
+
+        remote_filters = worker_set.foreach_worker(
+            func=lambda worker: worker.get_filters(flush_after=True),
+            timeout_seconds=timeout_seconds,
+        )
 
         for rf in remote_filters:
             for k in local_filters:
                 local_filters[k].apply_changes(rf[k], with_buffer=False)
+
         if update_remote:
             copies = {k: v.as_serializable() for k, v in local_filters.items()}
             remote_copy = ray.put(copies)
 
-            try:
-                ray.get(
-                    [r.sync_filters.remote(remote_copy) for r in remotes],
-                    timeout=timeout_seconds,
-                )
-            except GetTimeoutError:
-                logger.error(
-                    "Failed to set remote filters to a rollout worker in "
-                    "FilterManager. "
-                    "Filtered "
-                    "metrics may be computed, but filtered wrong."
-                )
+            logger.info("Updating remote filters ...")
+            worker_set.foreach_worker(
+                func=lambda worker: worker.sync_filters(remote_copy),
+                timeout_seconds=timeout_seconds,
+            )
