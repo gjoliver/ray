@@ -168,6 +168,10 @@ def get_dataset_and_shards(
     else:
         raise ValueError("Un-supported Ray dataset format: ", format)
 
+    # Convert to python dict up-front, so we don't waste time on this conversion
+    # over and over again.
+    dataset = dataset.map_batches(lambda d: [r.to_dict() for _, r in d.iterrows()])
+
     # Local worker will be responsible for sampling.
     if num_workers == 0:
         # Dataset is the only shard we need.
@@ -237,7 +241,6 @@ class DatasetReader(InputReader):
                     if not self._ioctx.config.get("_disable_preprocessors", False)
                     else None
                 )
-            self._dataset.random_shuffle(seed=seed)
             print(
                 f"DatasetReader {self._ioctx.worker_index} has {ds.count()}, samples."
             )
@@ -255,7 +258,7 @@ class DatasetReader(InputReader):
         ret = []
         count = 0
         while count < self.batch_size:
-            d = next(self._iter).as_pydict()
+            d = next(self._iter)
             # Columns like obs are compressed when written by DatasetWriter.
             d = from_json_data(d, self._ioctx.worker)
             count += d.count
