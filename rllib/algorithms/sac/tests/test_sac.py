@@ -264,15 +264,11 @@ class TestSAC(unittest.TestCase):
                 weights_dict_list = (
                     policy.model.variables() + policy.target_model.variables()
                 )
-                collector = ray.experimental.tf_utils.TensorFlowVariables(
-                    [], policy.get_session(), weights_dict_list, debug=True
-                )
-
-                weights_dict = collector.get_weights()
-
-                weights_dict = {v.name.split(":")[0]: v for v in weights_dict_list}
-                weights_dict2 = policy.get_weights()
-                breakpoint()
+                with p_sess.graph.as_default():
+                    collector = ray.experimental.tf_utils.TensorFlowVariables(
+                        [], policy.get_session(), weights_dict_list,
+                    )
+                    weights_dict = collector.get_weights()
 
                 if fw == "tfe":
                     log_alpha = weights_dict[10]
