@@ -855,7 +855,7 @@ py_test(
 py_test(
     name = "test_apex_ddpg",
     tags = ["team:rllib", "algorithms_dir"],
-    size = "medium",
+    size = "large",
     srcs = ["algorithms/apex_ddpg/tests/test_apex_ddpg.py"]
 )
 
